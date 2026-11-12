@@ -6,14 +6,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Barrier, Thread
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from dashboard import handler_for
 from execution import DemoVenue, Desk, RITVenue, Strategy
-from rotman_lt3 import CAP, demo_snapshot
+from rotman_lt3 import CAP, RateLimited, STALE_SNAPSHOT, demo_snapshot
 
 
 @contextlib.contextmanager
@@ -45,6 +45,9 @@ class MockRIT:
         self.authorization = None
         self.fail_read = False
         self.fail_accept_after_commit = False
+        self.read_gate = None
+        self.reads = []
+        self.waits = {}
 
     @property
     def ticker(self):
@@ -67,6 +70,12 @@ class MockRIT:
             def do_GET(self):
                 mock.authorization = self.headers.get("Authorization")
                 url = urlsplit(self.path)
+                mock.reads.append(url.path)
+                if mock.read_gate and url.path != "/v1/case":
+                    mock.read_gate.wait(timeout=1)
+                if url.path in mock.waits:
+                    self.answer({"wait": mock.waits[url.path]}, 429)
+                    return
                 if url.path == "/v1/case":
                     self.answer(mock.case, 503 if mock.fail_read else 200)
                 elif url.path == "/v1/securities":
@@ -113,10 +122,19 @@ class MockRIT:
 
 
 @contextlib.contextmanager
-def rit_desk(mock, enable_orders=True):
+def rit_desk(mock, enable_orders=True, *, mode="client"):
     with TemporaryDirectory() as folder, server_for(mock.handler()) as server:
-        with patch("rotman_lt3.getpass", return_value="mock-api-key"):
-            venue = RITVenue(server.server_port, enable_orders)
+        if mode == "dma":
+            def connect(host, port, timeout):
+                assert (host, port) == ("flserver.rotman.utoronto.ca", 16540)
+                return HTTPConnection("127.0.0.1", server.server_port, timeout=timeout)
+
+            with patch("rotman_lt3.HTTPConnection", side_effect=connect), \
+                 patch("builtins.input", return_value="team"), patch("rotman_lt3.getpass", return_value="pass"):
+                venue = RITVenue(None, enable_orders, mode=mode)
+        else:
+            with patch("rotman_lt3.getpass", return_value="mock-api-key"):
+                venue = RITVenue(server.server_port, enable_orders)
         desk = Desk(venue, "rit", Path(folder))
         try:
             yield desk
@@ -185,25 +203,44 @@ class ExecutionTests(unittest.TestCase):
 
     def test_mac_dma_uses_basic_auth_and_sends_fixed_tender_price(self):
         mock = MockRIT()
-        with TemporaryDirectory() as folder, server_for(mock.handler()) as server:
-            def connect(host, port, timeout):
-                self.assertEqual((host, port), ("flserver.rotman.utoronto.ca", 16540))
-                return HTTPConnection("127.0.0.1", server.server_port, timeout=timeout)
+        with rit_desk(mock, mode="dma") as desk:
+            desk.poll()
+            self.assertEqual(mock.authorization, "Basic dGVhbTpwYXNz")
+            self.assertEqual(desk.state()["connection"], "dma")
+            desk.command("arm", {"api_orders_enabled": True})
+            desk.poll()
+            self.assertEqual(mock.writes[0], ("POST", "/v1/tenders/3", {"price": ["9.85"]}))
+            desk.poll()
+            self.assertEqual(mock.writes[1][1], "/v1/orders")
 
-            with patch("rotman_lt3.HTTPConnection", side_effect=connect), patch("builtins.input", return_value="team"), patch("rotman_lt3.getpass", return_value="pass"):
-                venue = RITVenue(None, True, mode="dma")
-            try:
-                desk = Desk(venue, "rit", Path(folder))
-                desk.poll()
-                self.assertEqual(mock.authorization, "Basic dGVhbTpwYXNz")
-                self.assertEqual(desk.state()["connection"], "dma")
-                desk.command("arm", {"api_orders_enabled": True})
-                desk.poll()
-                self.assertEqual(mock.writes[0], ("POST", "/v1/tenders/3", {"price": ["9.85"]}))
-                desk.poll()
-                self.assertEqual(mock.writes[1][1], "/v1/orders")
-            finally:
-                venue.close()
+    def test_mac_dma_reads_in_parallel_between_clock_checks(self):
+        mock = MockRIT()
+        mock.read_gate = Barrier(5)
+        with rit_desk(mock, enable_orders=False, mode="dma") as desk:
+            desk.poll()
+            self.assertTrue(desk.state()["fresh"])
+            self.assertEqual(mock.reads[0], "/v1/case")
+            self.assertEqual(mock.reads[-1], "/v1/case")
+            self.assertEqual(len(mock.reads), 7)
+            self.assertIn("recheck_ms", desk.venue.snapshot_timing)
+            self.assertEqual(mock.writes, [])
+
+    def test_mac_dma_honours_longest_backoff_in_parallel_batch(self):
+        mock = MockRIT()
+        mock.waits = {"/v1/orders": 1, "/v1/tenders": 3}
+        with rit_desk(mock, enable_orders=False, mode="dma") as desk:
+            with self.assertRaises(RateLimited) as limited:
+                desk.venue.snapshot(50)
+            self.assertEqual(limited.exception.wait, 3)
+            self.assertEqual(mock.reads.count("/v1/case"), 1)
+            self.assertEqual(mock.writes, [])
+
+    def test_mac_dma_skips_market_reads_if_initial_clock_is_already_stale(self):
+        mock = MockRIT()
+        with rit_desk(mock, enable_orders=False, mode="dma") as desk:
+            with patch("rotman_lt3.MAX_SNAPSHOT_AGE", 0):
+                self.assertEqual(desk.venue.snapshot(50), (STALE_SNAPSHOT, None))
+            self.assertEqual(mock.reads, ["/v1/case"])
 
     def test_both_sides_fill_and_reconcile(self):
         for side, cap, action in (("BUY", 25_000, "SELL"), ("SELL", 10_000, "BUY")):

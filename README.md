@@ -27,6 +27,16 @@ During practice, compare tender direction, size, expiry and fees with the RIT di
 
 Use `--state-dir` for a separate rehearsal or practice profile. Use `--no-open` to open the local URL yourself. The original `--rit` flag remains a Windows alias.
 
+### Measure the Mac connection before a heat
+
+Run the read-only probe while an LT3 practice heat is active. It prompts for RIT credentials in the terminal and reports the initial clock, account and books, and clock recheck timings.
+
+```sh
+python3 rotman_lt3.py probe dma --samples 10
+```
+
+Compare the fresh-snapshot counts and timings on Wi-Fi and a phone hotspot if the desk is slow. A paused or stopped heat cannot test active-feed freshness. The Mac reader fetches account, tenders and both books concurrently between two clock checks. It keeps the 1.5-second and one-tick freshness checks and honours DMA rate-limit backoff.
+
 ## Strategy and controls
 
 - **Entry.** Score the whole block against executable bids or asks, fees, depth loss and an adverse move. For each tender, the minimum time left is the greater of the fixed floor and `closeout reserve + ticks per child × minimum child orders`. The desk accepts at most one tender at a time and waits for RIT to report the resulting signed position.

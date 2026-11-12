@@ -62,9 +62,6 @@ class RITVenue(RITReader):
         self.enable_orders = enable_orders
         self.next_submit = 0.0
 
-    def close(self):
-        self.connection.close()
-
     def write(self, method, endpoint, **params):
         if not self.enable_orders:
             raise RuntimeError("Order submission is disabled for this session")

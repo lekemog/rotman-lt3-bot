@@ -15,8 +15,10 @@ The stress settings are starting assumptions, to be calibrated from practice.
 import argparse
 import base64
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from getpass import getpass
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 import json
@@ -32,6 +34,8 @@ NET_LIMIT = 100_000
 GROSS_LIMIT = 250_000
 ZERO = Decimal(0)
 CENT = Decimal("0.01")
+MAX_SNAPSHOT_AGE = 1.5
+STALE_SNAPSHOT = "SNAPSHOT TOO OLD OR HEAT CHANGED"
 
 
 def decimal(value):
@@ -233,21 +237,37 @@ class RateLimited(Exception):
 class RITReader:
     def __init__(self, mode, port=None, *, dma_https=False):
         self.connection_mode = mode
+        self.read_pool = None
+        self.read_connections = []
+        self.snapshot_timing = {}
         if mode == "client":
             self.connection = HTTPConnection("127.0.0.1", port or 9999, timeout=2)
             self.headers = {"X-API-Key": getpass("RIT Client API key: ")}
         else:
             connect = HTTPSConnection if dma_https else HTTPConnection
-            self.connection = connect("flserver.rotman.utoronto.ca", port or 16540, timeout=2)
+            self.connect_dma = partial(connect, "flserver.rotman.utoronto.ca", port or 16540, timeout=2)
+            self.connection = self.connect_dma()
             credentials = f"{input('RIT Trader ID: ')}:{getpass('RIT password: ')}"
             self.headers = {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode()}
 
+    def close(self):
+        if self.read_pool is not None:
+            self.read_pool.shutdown(wait=True)
+            self.read_pool = None
+        for connection in self.read_connections:
+            connection.close()
+        self.read_connections.clear()
+        self.connection.close()
+
     def get(self, endpoint, **params):
+        return self.read(self.connection, endpoint, **params)
+
+    def read(self, connection, endpoint, **params):
         path = f"/v1/{endpoint}"
         if params:
             path += "?" + urlencode(params)
-        self.connection.request("GET", path, headers=self.headers)
-        response = self.connection.getresponse()
+        connection.request("GET", path, headers=self.headers)
+        response = connection.getresponse()
         body = response.read()
         if response.status == 429:
             try:
@@ -260,32 +280,69 @@ class RITReader:
             raise RuntimeError(f"RIT {endpoint} returned HTTP {response.status}")
         return json.loads(body)
 
+    def read_snapshot_data(self, depth):
+        requests = [("securities", {}), ("orders", {"status": "OPEN"}), ("tenders", {})]
+        requests.extend(("securities/book", {"ticker": ticker, "limit": depth}) for ticker in CAP)
+        if self.connection_mode == "client":
+            return [self.get(endpoint, **params) for endpoint, params in requests]
+
+        # One persistent connection per independent GET. The main connection
+        # remains serial for the clock checks and order submissions.
+        if self.read_pool is None:
+            self.read_pool = ThreadPoolExecutor(max_workers=len(requests))
+            self.read_connections = [self.connect_dma() for _ in requests]
+        pending = [self.read_pool.submit(self.read, connection, endpoint, **params)
+                   for connection, (endpoint, params) in zip(self.read_connections, requests)]
+        errors = [future.exception() for future in pending]
+        limits = [error for error in errors if isinstance(error, RateLimited)]
+        if limits:
+            raise max(limits, key=lambda error: error.wait)
+        return [future.result() for future in pending]
+
     def snapshot(self, depth):
         started = time.monotonic()
+        self.snapshot_timing = {}
+        try:
+            return self.read_snapshot(depth, started)
+        finally:
+            self.snapshot_timing["total_ms"] = round((time.monotonic() - started) * 1000)
+
+    def read_snapshot(self, depth, started):
+        self.snapshot_timing["stage"] = "initial clock"
         before = self.get("case")
+        self.snapshot_timing["clock_ms"] = round((time.monotonic() - started) * 1000)
         if before["status"] != "ACTIVE":
             return before["status"], None
+        if time.monotonic() - started > MAX_SNAPSHOT_AGE:
+            return STALE_SNAPSHOT, None
 
-        positions = {row["ticker"]: shares(row["position"]) for row in self.get("securities")}
+        self.snapshot_timing["stage"] = "account and books"
+        data_started = time.monotonic()
+        securities, open_orders, tenders, *raw_books = self.read_snapshot_data(depth)
+        self.snapshot_timing["data_ms"] = round((time.monotonic() - data_started) * 1000)
+        if time.monotonic() - started > MAX_SNAPSHOT_AGE:
+            return STALE_SNAPSHOT, None
+
+        positions = {row["ticker"]: shares(row["position"]) for row in securities}
         if set(positions) != set(CAP):
             raise RuntimeError("Expected exactly the Dublin case tickers CRZY and TAME")
-        open_orders = self.get("orders", status="OPEN")
-        tenders = self.get("tenders")
         books = {}
-        for ticker in CAP:
-            book = self.get("securities/book", ticker=ticker, limit=depth)
+        for ticker, book in zip(CAP, raw_books):
             books[ticker] = {
                 side: [{field: order[field] for field in ("price", "quantity", "quantity_filled")}
                        for order in book[side]]
                 for side in ("bids", "asks")
             }
+        self.snapshot_timing["stage"] = "clock recheck"
+        confirm_started = time.monotonic()
         after = self.get("case")
+        self.snapshot_timing["recheck_ms"] = round((time.monotonic() - confirm_started) * 1000)
         tick = shares(after["tick"])
         period = shares(after["period"])
         if (after["status"] != "ACTIVE" or before["period"] != after["period"]
                 or not 0 <= tick - shares(before["tick"]) <= 1
-                or time.monotonic() - started > 1.5):
-            return "SNAPSHOT TOO OLD OR HEAT CHANGED", None
+                or time.monotonic() - started > MAX_SNAPSHOT_AGE):
+            return STALE_SNAPSHOT, None
 
         fields = ("tender_id", "ticker", "period", "expires", "caption",
                   "is_fixed_bid", "price", "quantity")
@@ -405,7 +462,7 @@ def watch(args, settings):
                 time.sleep(error.wait)
                 continue
             except (OSError, HTTPException) as error:
-                client.connection.close()
+                client.close()
                 print(f"Connection interrupted. Recommendations paused ({error}).", flush=True)
                 time.sleep(args.interval)
                 continue
@@ -424,7 +481,42 @@ def watch(args, settings):
     finally:
         if record:
             record.close()
-        client.connection.close()
+        client.close()
+
+
+def probe(args):
+    client = RITReader(args.mode, args.rit_port, dma_https=args.dma_https)
+    fresh, inactive = 0, 0
+    try:
+        for index in range(1, args.samples + 1):
+            delay = 1.0
+            try:
+                status, snapshot = client.snapshot(50)
+                if snapshot:
+                    fresh += 1
+                    status = f"FRESH · tick {snapshot['tick']}"
+                elif status in ("STOPPED", "PAUSED"):
+                    inactive += 1
+            except RateLimited as error:
+                status, delay = f"RATE LIMITED · wait {error.wait:.2f}s", max(delay, error.wait)
+            except (OSError, HTTPException, RuntimeError) as error:
+                status = f"{client.snapshot_timing['stage']} · {error}"
+                client.close()
+                if "returned HTTP 401" in str(error):
+                    print(f"{index:02d} | {status}", flush=True)
+                    break
+            timing = client.snapshot_timing
+            parts = [f"{label} {timing[key]} ms" for label, key in
+                     (("clock", "clock_ms"), ("account/books", "data_ms"), ("recheck", "recheck_ms"))
+                     if key in timing]
+            print(f"{index:02d} | {status} | total {timing['total_ms']} ms"
+                  + (f" ({', '.join(parts)})" if parts else ""), flush=True)
+            if index < args.samples:
+                time.sleep(delay)
+        print(f"{fresh}/{index - inactive} fresh snapshots across non-paused samples · "
+              f"{inactive} paused or stopped samples excluded")
+    finally:
+        client.close()
 
 
 def add_settings(parser):
@@ -445,6 +537,11 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     add_settings(commands.add_parser("demo"))
     commands.add_parser("self-test")
+    probe_parser = commands.add_parser("probe", help="Measure read-only practice feed freshness")
+    probe_parser.add_argument("mode", choices=("client", "dma"))
+    probe_parser.add_argument("--samples", type=int, default=8)
+    probe_parser.add_argument("--rit-port", type=int)
+    probe_parser.add_argument("--dma-https", action="store_true")
     replay_parser = commands.add_parser("replay")
     replay_parser.add_argument("input", type=Path)
     add_settings(replay_parser)
@@ -458,6 +555,16 @@ def main():
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
+        return
+    if args.command == "probe":
+        if not 1 <= args.samples <= 30 or (args.rit_port is not None and not 1 <= args.rit_port <= 65535):
+            parser.error("Use 1–30 samples and a valid RIT port")
+        if args.dma_https and args.mode != "dma":
+            parser.error("Use --dma-https with DMA")
+        try:
+            probe(args)
+        except KeyboardInterrupt:
+            print("\nStopped.")
         return
 
     settings = Settings(args.market_fee, args.tender_fee, args.depth_haircut, args.adverse_move,
