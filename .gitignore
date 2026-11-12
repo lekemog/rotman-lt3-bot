@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.rotman/
+.venv/
+.env
+.env.*
+*.jsonl
