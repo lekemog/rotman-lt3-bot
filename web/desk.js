@@ -1,224 +1,374 @@
 "use strict";
 
-const byId = (id) => document.getElementById(id);
-const form = byId("strategy-form");
+const el = (id) => document.getElementById(id);
+const form = el("strategy-form");
+const radios = [...document.querySelectorAll("input[name='entry-mode']")];
 const whole = new Intl.NumberFormat("en-IE");
-const usd = new Intl.NumberFormat("en-US", {
-  style: "currency",
-  currency: "USD",
-});
-const money = (value) => (value == null ? "—" : usd.format(Number(value)));
-const number = (value) => (value == null ? "—" : whole.format(value));
+const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const number = (value) => value == null ? "—" : whole.format(value);
+const money = (value) => value == null ? "—" : usd.format(Number(value));
+const entryMode = () => radios.find((radio) => radio.checked).value;
+const text = (id, value) => { el(id).textContent = value; };
+const badge = (id, value, tone = "") => {
+  text(id, value);
+  el(id).dataset.tone = tone;
+};
+const fields = {
+  depth_haircut: ["Depth removed", "%"],
+  adverse_move: ["Adverse move", " $/share"],
+  min_edge: ["Minimum edge", " $/share"],
+  market_fee: ["Market fee", " $/share"],
+  tender_fee: ["Tender fee", " $/share"],
+  decision_ticks: ["Expiry buffer", " ticks"],
+  min_heat_ticks: ["Minimum time left", " ticks"],
+  ticks_per_child: ["Budget per order", " ticks"],
+  exit_reserve_ticks: ["Exit reserve", " ticks"],
+  limit_slippage_ticks: ["Limit price cushion", "¢"],
+  market_closeout_ticks: ["Market closeout window", " ticks"],
+};
+
 let state;
-let draft = false;
+let offer;
+let selectedId;
+let pickerKey = "";
+let eventKey = "";
+let draftRevision = null;
+let loadedRevision;
 let writing = false;
-let lastRevision;
 
-function node(tag, text, classes) {
-  const el = document.createElement(tag);
-  if (text != null) el.textContent = text;
-  if (classes) el.className = classes;
-  return el;
+function node(tag, label, css) {
+  const element = document.createElement(tag);
+  if (label != null) element.textContent = label;
+  if (css) element.className = css;
+  return element;
 }
 
-function text(id, value) {
-  byId(id).textContent = value;
+function amount(id, value, format = money) {
+  text(id, format(value));
+  el(id).classList.toggle("positive", Number(value) > 0);
+  el(id).classList.toggle("negative", Number(value) < 0);
 }
 
-function tone(element, value) {
-  element.classList.toggle("positive", Number(value) > 0);
-  element.classList.toggle("negative", Number(value) < 0);
+function flat() {
+  return state?.fresh && !state.inventory && !state.open_orders &&
+    !Object.values(state.positions).some(Boolean);
 }
 
-function applyForm(strategy) {
-  for (const [name, value] of Object.entries(strategy)) {
-    form.elements.namedItem(name).value = value;
+function updateControls() {
+  const live = state?.mode === "rit";
+  const reviewArmed = state?.armed && state.entry_mode === "review";
+  const autoArmed = state?.armed && state.entry_mode === "auto";
+  const dirty = draftRevision != null;
+  el("arm").disabled = writing || !flat() || !state?.order_enabled || Boolean(state?.fault || state?.halted || state?.armed || dirty) ||
+    (live && !el("api-ack").checked);
+  el("pause").disabled = writing || !state?.armed;
+  el("halt").disabled = writing || !state?.order_enabled || state?.halted;
+  el("reset").disabled = writing || !state?.fresh || Boolean(state?.open_orders) ||
+    Object.values(state?.positions || {}).some(Boolean);
+  el("approve").hidden = !reviewArmed || !offer?.ticker;
+  el("approve").disabled = writing || !flat() || !reviewArmed || !offer || offer.status !== "ACCEPT" ||
+    Boolean(state?.approval != null || dirty || state?.fault || state?.halted);
+  el("skip").disabled = writing || !state?.fresh || autoArmed || offer?.id == null;
+  for (const radio of radios) radio.disabled = writing || Boolean(state?.armed) || !state?.order_enabled;
+  text("arm", "Arm " + (entryMode() === "review" ? "Review" : "Auto"));
+  el("apply").disabled = writing || !dirty;
+  el("restore").disabled = writing || !dirty;
+  el("restart").disabled = writing;
+  for (const button of form.querySelectorAll("[data-preset]")) button.disabled = writing || !state;
+}
+
+function fillForm() {
+  for (const [key, value] of Object.entries(state.strategy)) {
+    form.elements.namedItem(key).value = value;
   }
-  draft = false;
+  loadedRevision = state.revision;
+  draftRevision = null;
 }
 
-function updateButtons() {
-  const armBlocked =
-    !state?.fresh ||
-    !state.order_enabled ||
-    state.armed ||
-    state.halted ||
-    state.fault ||
-    state.open_orders ||
-    Object.values(state.positions).some(Boolean) ||
-    draft ||
-    (state.mode === "rit" && !byId("api-ack").checked);
-  byId("arm").disabled = Boolean(writing || armBlocked);
-  byId("pause").disabled = Boolean(writing || !state?.armed);
-  byId("halt").disabled = Boolean(
-    writing || !state?.order_enabled || state.halted,
-  );
-  byId("reset").disabled = writing;
-  byId("apply").disabled = writing || !draft;
-  byId("restore").disabled = writing || !draft;
-  byId("restart").disabled = writing;
+function renderDraft() {
+  const active = state?.strategy;
+  if (!active) return;
+  const data = Object.fromEntries(new FormData(form));
+  const edits = [];
+  for (const [key, [label, unit]] of Object.entries(fields)) {
+    if (data[key] === "" || Number(data[key]) !== Number(active[key])) {
+      const proposed = data[key] === "" ? "missing value" : data[key] + unit;
+      edits.push(node("li", label + " · " + active[key] + unit + " → " + proposed));
+    }
+  }
+  if (!edits.length) draftRevision = null;
+  const behind = draftRevision != null && draftRevision !== state.revision;
+  if (behind) edits.unshift(node("li", "The active revision changed. Discard edits to reload it."));
+  el("draft").hidden = edits.length === 0;
+  el("changes").replaceChildren(...edits);
+  updateControls();
 }
 
-function showMessage(message) {
-  text("message", message);
-  byId("message").hidden = !message;
+function stagePreset(preset) {
+  const active = state.strategy;
+  const changes = preset === "defensive"
+    ? { depth_haircut: Math.max(active.depth_haircut, 25), adverse_move: Math.max(active.adverse_move, 0.02) }
+    : { min_heat_ticks: Math.max(active.min_heat_ticks, 35), ticks_per_child: Math.max(active.ticks_per_child, 8),
+        exit_reserve_ticks: Math.max(active.exit_reserve_ticks, 15) };
+  for (const [key, value] of Object.entries(changes)) form.elements.namedItem(key).value = value;
+  draftRevision ??= loadedRevision;
+  renderDraft();
+}
+
+function renderSession() {
+  const live = state.mode === "rit";
+  const connection = state.connection === "dma" ? "MacBook · DMA" : "Windows · RIT Client";
+  badge("connection", live ? connection + (state.order_enabled ? "" : " · Monitor") : "Rehearsal");
+  el("recording").hidden = !state.recording;
+  text("feed", state.fresh ? "Feed current" : state.status);
+  el("feed-dot").classList.toggle("ok", state.fresh);
+  text("case-name", state.case_name);
+  const remaining = Math.max(0, state.end_tick - state.tick);
+  text("timer", state.fresh ? Math.floor(remaining / 60) + ":" + String(remaining % 60).padStart(2, "0") : "—");
+  text("tick", state.fresh ? "Tick " + state.tick + " / " + state.end_tick : "Waiting for current heat");
+  el("progress").max = state.end_tick;
+  el("progress").value = state.tick;
+
+  if (state.fault) badge("engine", "Review in RIT", "bad");
+  else if (state.halted) badge("engine", "Manual takeover", "bad");
+  else if (!state.fresh) badge("engine", "Feed unavailable", "warn");
+  else if (state.armed) badge("engine", state.entry_mode === "review" ? "Review armed" : "Auto armed", "good");
+  else badge("engine", "Entries paused");
+
+  if (state.armed) radios.find((radio) => radio.value === state.entry_mode).checked = true;
+  el("ack").hidden = !live || !state.order_enabled || state.armed || state.halted || Boolean(state.fault);
+  if (!state.fresh || state.armed) el("api-ack").checked = false;
+  el("fault").hidden = !state.fault;
+  text("fault", state.fault);
+  el("rehearsal").hidden = live;
+  updateHelp();
+}
+
+function updateHelp() {
+  if (!state) return;
+  let help;
+  if (state.fault || state.halted) help = "Check orders and positions in RIT before taking over.";
+  else if (!state.order_enabled) help = "Monitor mode. The dashboard shows the bot’s recommendation.";
+  else if (state.armed) help = state.entry_mode === "review"
+    ? "You approve each eligible tender. The bot manages the exit."
+    : "The bot accepts eligible tenders and manages exits automatically.";
+  else if (state.inventory) help = "Entries are paused. The bot is still managing the exit.";
+  else help = entryMode() === "review" ? "Approve each entry yourself, then let the bot unwind."
+    : "Let the bot accept eligible tenders and unwind automatically.";
+  text("control-help", help);
+}
+
+function priority(a, b) {
+  const eligible = Number(b.status === "ACCEPT") - Number(a.status === "ACCEPT");
+  if (eligible) return eligible;
+  if (a.status === "ACCEPT" && Number(a.stressed) !== Number(b.stressed)) {
+    return Number(b.stressed) - Number(a.stressed);
+  }
+  return (a.remaining ?? Infinity) - (b.remaining ?? Infinity);
+}
+
+function renderOffer() {
+  const tenders = state.fresh ? [...state.tenders].sort(priority) : [];
+  const select = el("offer-select");
+  offer = tenders.find((tender) => String(tender.id) === selectedId) || tenders[0];
+  if (offer) selectedId = String(offer.id);
+  const nextKey = JSON.stringify(tenders.map((tender) => [tender.id, tender.ticker, tender.side, tender.quantity]));
+  if (pickerKey !== nextKey) {
+    pickerKey = nextKey;
+    select.replaceChildren(...tenders.map((tender) => {
+      const label = tender.ticker ? tender.side + " " + number(tender.quantity) + " " + tender.ticker : "Offer #" + tender.id;
+      const option = node("option", label);
+      option.value = tender.id;
+      return option;
+    }));
+  }
+  if (offer) select.value = offer.id;
+  el("picker").hidden = tenders.length < 2;
+  el("offer-details").hidden = !offer?.ticker;
+  el("decision-reason").hidden = !offer;
+  el("tender-actions").hidden = !offer;
+  if (!offer) {
+    text("tender-title", state.fresh ? "Waiting for an offer" : "Waiting for fresh data");
+    text("tender-subtitle", state.fresh ? "Active offers will appear here." : "Tender controls resume once the heat feed is current.");
+    badge("tender-status", "No tender");
+    return;
+  }
+  text("tender-title", offer.ticker ? offer.side + " " + number(offer.quantity) + " " + offer.ticker : "Offer #" + offer.id);
+  text("tender-subtitle", offer.ticker ? money(offer.price) + " per share · Tender #" + offer.id : "Check the tender in the RIT client");
+  const queued = state.approval === offer.id;
+  const reviewArmed = state.armed && state.entry_mode === "review";
+  const labels = { WAIT: ["Wait", "warn"], PASS: ["Pass", "warn"], REVIEW: ["Check in RIT", "warn"], EXPIRED: ["Expired", "bad"] };
+  const status = queued ? ["Checking latest book", "warn"] : offer.status === "ACCEPT"
+    ? [reviewArmed ? "Ready for approval" : "Eligible", "good"] : (labels[offer.status] || [offer.status, ""]);
+  badge("tender-status", ...status);
+  text("decision-reason", offer.reason);
+  if (!offer.ticker) return;
+  amount("stressed", offer.stressed);
+  amount("visible", offer.visible);
+  text("expires", offer.remaining + " ticks");
+  el("expires").dataset.tone = offer.remaining <= state.strategy.decision_ticks ? "bad" : "";
+  text("depth", number(offer.depth) + " / " + number(offer.quantity) + " shares");
+  el("depth-bar").value = Math.min(100, offer.depth / offer.quantity * 100);
+  const left = Math.max(0, state.end_tick - state.tick);
+  text("budget", left + " ticks left in heat · exit budget " + offer.budget + " ticks");
+  text("approve", queued ? "Approval queued" : "Approve " + offer.side.toLowerCase() + " tender");
+}
+
+function renderPosition() {
+  const inventory = state.inventory;
+  const working = state.working;
+  const hasPosition = Object.values(state.positions).some(Boolean);
+  el("exit-progress").hidden = !inventory;
+  el("reset").hidden = !state.fault && !state.halted;
+  let title = state.fresh ? "Flat" : "Position unverified";
+  let detail = state.fresh ? "No inventory to unwind." : "Last known exposure needs confirmation in RIT.";
+  if (inventory) {
+    title = state.halted || state.fault ? "Check remaining inventory in RIT"
+      : inventory.confirmed ? "Unwinding " + inventory.ticker : "Confirming tender fill";
+    detail = "Tender #" + inventory.id + " · Exit side " + inventory.exit_side.toLowerCase() +
+      (state.fresh ? "" : " · Last known inventory");
+    text("exit-remaining", number(inventory.remaining));
+    el("exit-bar").value = (1 - inventory.remaining / inventory.quantity) * 100;
+    text("working", working ? (working.cancelling ? "Cancellation requested for " : "Reconciling ") +
+      "order #" + working.id + " · " + number(working.quantity) + " submitted"
+      : "No managed child order working");
+  } else if (state.fresh && (hasPosition || state.open_orders)) {
+    title = "Check account in RIT";
+    detail = "This desk has no confirmed tender to manage.";
+  }
+  text("inventory-title", title);
+  text("exit-detail", detail);
+  badge("order-count", state.fresh ? number(state.open_orders) + " open" : "Orders unverified",
+    state.fresh && state.open_orders ? "warn" : "");
+  for (const ticker of ["CRZY", "TAME"]) {
+    amount("position-" + ticker.toLowerCase(), state.fresh ? state.positions[ticker] : null, number);
+  }
+  amount("pnl", state.pnl);
+  text("completed", state.completed + " completed");
+}
+
+function renderEvents() {
+  const nextKey = JSON.stringify(state.events);
+  if (nextKey === eventKey) return;
+  eventKey = nextKey;
+  const rows = state.events.map((event) => {
+    const row = node("li");
+    row.append(node("time", event.time), node("b", event.event), node("span", event.message));
+    return row;
+  });
+  if (!rows.length) rows.push(node("li", "No desk activity yet", "empty"));
+  el("events").replaceChildren(...rows);
 }
 
 function render(next) {
+  if (state && state.heat !== next.heat) {
+    selectedId = undefined;
+    el("api-ack").checked = false;
+  }
   state = next;
-  const live = state.mode === "rit";
-  text(
-    "mode",
-    live
-      ? state.order_enabled
-        ? "RIT · ORDER CONTROL"
-        : "RIT · MONITOR"
-      : "REHEARSAL",
-  );
-  text("feed", state.fresh ? "Data current" : state.status);
-  byId("feed-dot").classList.toggle("ok", state.fresh);
-  text("case-name", state.case_name);
-  const left = Math.max(0, state.end_tick - state.tick);
-  text(
-    "timer",
-    state.fresh
-      ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`
-      : "—",
-  );
-  text(
-    "tick",
-    state.fresh
-      ? `Tick ${state.tick} / ${state.end_tick}`
-      : "Waiting for current heat",
-  );
-  byId("progress").max = state.end_tick;
-  byId("progress").value = state.tick;
-  text(
-    "engine",
-    state.fault
-      ? "REVIEW IN RIT"
-      : state.halted
-        ? "STOPPED"
-        : state.armed
-          ? "ARMED"
-          : "ENTRIES PAUSED",
-  );
-  byId("engine").classList.toggle("armed", state.armed);
-  byId("engine").classList.toggle(
-    "halted",
-    state.halted || Boolean(state.fault),
-  );
-  byId("reset").hidden = !state.halted && !state.fault;
-  byId("ack").hidden = !live || !state.order_enabled || state.armed;
-  if (!state.fresh) byId("api-ack").checked = false;
-  byId("fault").hidden = !state.fault;
-  text("fault", state.fault);
-  text(
-    "control-help",
-    live && !state.order_enabled
-      ? "Monitor mode uses the RIT data feed."
-      : state.halted
-        ? "Check remaining positions and orders in RIT."
-        : state.armed
-          ? "The desk unwinds confirmed tender inventory."
-          : "Pausing entries lets an existing unwind finish.",
-  );
-  byId("rehearsal").hidden = live;
-  for (const ticker of ["CRZY", "TAME"]) {
-    const key = ticker.toLowerCase();
-    const value = state.positions[ticker];
-    text(`position-${key}`, state.fresh ? number(value) : "—");
-    tone(byId(`position-${key}`), value);
-    text(
-      `quote-${key}`,
-      `Mid ${state.fresh ? money(state.quotes[ticker]) : "—"}`,
-    );
-  }
-  text("pnl", money(state.pnl));
-  tone(byId("pnl"), state.pnl);
-  text(
-    "completed",
-    `${state.completed} completed ${state.completed === 1 ? "tender" : "tenders"}`,
-  );
-  text("orders", state.fresh ? number(state.open_orders) : "—");
-  text("revision", `Revision ${state.revision}`);
-  if (!draft && lastRevision !== state.revision) applyForm(state.strategy);
-  lastRevision = state.revision;
-  renderTenders(state.tenders);
-  renderEvents(state.events);
-  draw(state.history);
-  updateButtons();
+  renderSession();
+  renderOffer();
+  renderPosition();
+  renderEvents();
+  badge("revision", "Revision " + state.revision);
+  const active = state.strategy;
+  text("active-profile", "Active · " + active.depth_haircut + "% depth removed · " +
+    (Number(active.adverse_move) * 100).toLocaleString("en-IE") + "¢ adverse move · " + active.min_heat_ticks + "-tick exit floor");
+  if (draftRevision == null && loadedRevision !== state.revision) fillForm();
+  renderDraft();
+  if (el("market-tape").open) draw(state.history);
 }
 
-function renderTenders(tenders) {
-  text("tender-count", `${tenders.length} pending`);
-  const body = byId("tenders");
-  body.replaceChildren();
-  if (!tenders.length) {
-    const cell = node("td", "No active tenders", "empty");
-    cell.colSpan = 5;
-    const row = node("tr");
-    row.append(cell);
-    body.append(row);
-  }
-  for (const tender of tenders) {
-    const row = node("tr");
-    const offer = node(
-      "td",
-      tender.ticker
-        ? `${tender.ticker} · ${tender.side} ${number(tender.quantity)}`
-        : `Tender #${tender.id}`,
-    );
-    offer.append(
-      node(
-        "small",
-        tender.price == null
-          ? "Open the RIT tender dialog"
-          : `${money(tender.price)} · #${tender.id}`,
-      ),
-    );
-    const visible = node("td", money(tender.visible), "amount");
-    const stressed = node("td", money(tender.stressed), "amount");
-    tone(visible, tender.visible);
-    tone(stressed, tender.stressed);
-    const decision = node("td");
-    decision.append(
-      node("span", tender.status, `decision ${tender.status.toLowerCase()}`),
-      node("small", tender.reason),
-    );
-    row.append(
-      offer,
-      node(
-        "td",
-        tender.remaining == null ? "—" : `${tender.remaining} ticks`,
-        "amount",
-      ),
-      visible,
-      stressed,
-      decision,
-    );
-    body.append(row);
+function notify(message, error = false) {
+  const box = el("message");
+  box.hidden = !message;
+  box.classList.toggle("danger", error);
+  text("message", message);
+}
+
+async function send(path, payload, success) {
+  if (writing) return;
+  writing = true;
+  updateControls();
+  try {
+    const response = await fetch(path, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Desk command failed");
+    if (path === "/api/strategy") draftRevision = null;
+    render(data);
+    notify(success);
+  } catch (error) {
+    notify(error.message, true);
+  } finally {
+    writing = false;
+    updateControls();
   }
 }
 
-function renderEvents(events) {
-  const target = byId("events");
-  target.replaceChildren();
-  if (!events.length)
-    target.append(node("li", "Waiting for desk activity", "empty"));
-  for (const event of events) {
-    const row = node("li");
-    row.append(
-      node("time", event.time),
-      node("b", event.event),
-      node("span", event.message),
-    );
-    target.append(row);
-  }
+function command(action, message, options = {}) {
+  send("/api/command", { action, ...options }, message);
 }
 
+form.addEventListener("input", () => {
+  draftRevision ??= loadedRevision;
+  renderDraft();
+});
+form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (draftRevision == null) return;
+  send("/api/strategy", { ...Object.fromEntries(new FormData(form)), expected_revision: draftRevision },
+    "Strategy applied");
+});
+for (const button of form.querySelectorAll("[data-preset]")) {
+  button.addEventListener("click", () => stagePreset(button.dataset.preset));
+}
+el("restore").addEventListener("click", () => { fillForm(); renderDraft(); });
+el("api-ack").addEventListener("change", updateControls);
+radios.forEach((radio) => radio.addEventListener("change", () => { updateHelp(); updateControls(); }));
+el("arm").addEventListener("click", () => command("arm", entryMode() === "review" ? "Review armed" : "Auto armed",
+  { entry_mode: entryMode(), api_orders_enabled: el("api-ack").checked }));
+el("pause").addEventListener("click", () => command("pause", "New entries paused"));
+el("halt").addEventListener("click", () => command("halt", "Takeover started. Confirm the cancellation and remaining inventory in RIT."));
+el("reset").addEventListener("click", () => command("reset", "Desk reset. Entries are paused."));
+el("offer-select").addEventListener("change", (event) => {
+  selectedId = event.target.value;
+  renderOffer();
+  updateControls();
+});
+el("approve").addEventListener("click", () => command("approve", "Approval queued for a fresh book check", {
+  tender_id: offer.id, heat: state.heat, period: state.period, revision: state.revision,
+  ticker: offer.ticker, side: offer.side, quantity: offer.quantity, price: offer.price,
+}));
+el("skip").addEventListener("click", () => command("skip", "Offer skipped by the desk for this heat",
+  { tender_id: offer.id, heat: state.heat, period: state.period }));
+el("rehearsal-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  command("restart", "Rehearsal restarted", Object.fromEntries(new FormData(event.target)));
+});
+el("market-tape").addEventListener("toggle", () => { if (el("market-tape").open) draw(state?.history || []); });
+window.addEventListener("resize", () => { if (el("market-tape").open) draw(state?.history || []); });
+
+async function refresh() {
+  if (!writing) {
+    try {
+      const response = await fetch("/api/state", { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const data = await response.json();
+      if (!writing && (!state || data.heat > state.heat ||
+          (data.heat === state.heat && data.revision >= state.revision && data.tick >= state.tick))) render(data);
+    } catch {
+      if (state && !writing) render({ ...state, fresh: false, status: "Desk disconnected" });
+    }
+  }
+  window.setTimeout(refresh, 650);
+}
+
+updateControls();
+refresh();
 function draw(history) {
-  const canvas = byId("chart");
+  const canvas = el("chart");
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
   const scale = window.devicePixelRatio || 1;
@@ -272,90 +422,3 @@ function draw(history) {
   });
 }
 
-async function send(path, payload, success) {
-  writing = true;
-  updateButtons();
-  try {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error);
-    if (path === "/api/strategy") applyForm(data.strategy);
-    if (payload.action === "arm") byId("api-ack").checked = false;
-    render(data);
-    showMessage(success);
-  } catch (error) {
-    showMessage(error.message);
-  } finally {
-    writing = false;
-    updateButtons();
-  }
-}
-
-form.addEventListener("input", () => {
-  draft = true;
-  updateButtons();
-});
-form.addEventListener("submit", (event) => {
-  event.preventDefault();
-  send(
-    "/api/strategy",
-    Object.fromEntries(new FormData(form)),
-    "Strategy applied",
-  );
-});
-byId("restore").addEventListener("click", () => {
-  applyForm(state.strategy);
-  updateButtons();
-});
-byId("api-ack").addEventListener("change", updateButtons);
-for (const [button, action, message] of [
-  ["arm", "arm", "Entries armed"],
-  ["pause", "pause", "New entries paused"],
-  [
-    "halt",
-    "halt",
-    "Desk stopped. Check the RIT blotter for any remaining inventory.",
-  ],
-  ["reset", "reset", "Desk reset"],
-]) {
-  byId(button).addEventListener("click", () => {
-    send(
-      "/api/command",
-      { action, api_orders_enabled: byId("api-ack").checked },
-      message,
-    );
-  });
-}
-byId("rehearsal-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  send(
-    "/api/command",
-    { action: "restart", ...Object.fromEntries(new FormData(event.target)) },
-    "Rehearsal restarted",
-  );
-});
-window.addEventListener("resize", () => draw(state?.history || []));
-
-async function refresh() {
-  if (!writing) {
-    try {
-      const response = await fetch("/api/state", { cache: "no-store" });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      if (!writing) render(data);
-    } catch {
-      if (state) state.fresh = false;
-      byId("feed-dot").classList.remove("ok");
-      text("feed", "Desk disconnected");
-      updateButtons();
-    }
-  }
-  window.setTimeout(refresh, 650);
-}
-
-updateButtons();
-refresh();

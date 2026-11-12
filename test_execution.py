@@ -42,6 +42,7 @@ class MockRIT:
                                    quantity=-20_000, price="10.80", action="BUY")
         self.orders = {}
         self.writes = []
+        self.authorization = None
         self.fail_read = False
         self.fail_accept_after_commit = False
 
@@ -64,6 +65,7 @@ class MockRIT:
                 self.wfile.write(payload)
 
             def do_GET(self):
+                mock.authorization = self.headers.get("Authorization")
                 url = urlsplit(self.path)
                 if url.path == "/v1/case":
                     self.answer(mock.case, 503 if mock.fail_read else 200)
@@ -123,6 +125,86 @@ def rit_desk(mock, enable_orders=True):
 
 
 class ExecutionTests(unittest.TestCase):
+    def review_payload(self, desk):
+        state = desk.state()
+        offer = state["tenders"][0]
+        return dict(tender_id=offer["id"], heat=state["heat"], period=state["period"],
+                    revision=state["revision"], ticker=offer["ticker"], side=offer["side"],
+                    quantity=offer["quantity"], price=offer["price"])
+
+    def test_review_requires_approval_and_rechecks_the_book(self):
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True, "entry_mode": "review"})
+            desk.poll()
+            self.assertEqual(mock.writes, [])
+            payload = self.review_payload(desk)
+            with self.assertRaises(ValueError):
+                desk.command("approve", dict(payload, quantity=payload["quantity"] + 1))
+            with self.assertRaises(ValueError):
+                desk.command("approve", dict(payload, heat=payload["heat"] - 1))
+            desk.command("approve", payload)
+            bids = mock.books["CRZY"]["bids"]
+            mock.books["CRZY"]["bids"] = []
+            desk.poll()
+            self.assertEqual(mock.writes, [])
+            self.assertEqual(desk.events[0]["event"], "APPROVAL LAPSED")
+            mock.books["CRZY"]["bids"] = bids
+            desk.poll()
+            self.assertEqual(mock.writes, [])
+            desk.command("approve", self.review_payload(desk))
+            self.assertEqual(desk.state()["approval"], payload["tender_id"])
+            desk.poll()
+            self.assertEqual([write[1] for write in mock.writes], ["/v1/tenders/3"])
+            self.assertFalse(desk.state()["inventory"]["confirmed"])
+
+    def test_skip_holds_when_switching_to_auto(self):
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.poll()
+            desk.command("skip", self.review_payload(desk))
+            desk.command("arm", {"api_orders_enabled": True})
+            desk.poll()
+            self.assertEqual(mock.writes, [])
+            self.assertEqual(desk.state()["tenders"], [])
+
+    def test_strategy_revision_invalidates_approval(self):
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True, "entry_mode": "review"})
+            payload = self.review_payload(desk)
+            desk.command("approve", payload)
+            desk.save_strategy(dict(asdict(desk.strategy), depth_haircut=15), expected_revision=1)
+            with self.assertRaises(ValueError):
+                desk.save_strategy(asdict(Strategy()), expected_revision=1)
+            desk.poll()
+            self.assertEqual(mock.writes, [])
+            self.assertIsNone(desk.state()["approval"])
+
+    def test_mac_dma_uses_basic_auth_and_sends_fixed_tender_price(self):
+        mock = MockRIT()
+        with TemporaryDirectory() as folder, server_for(mock.handler()) as server:
+            def connect(host, port, timeout):
+                self.assertEqual((host, port), ("flserver.rotman.utoronto.ca", 16540))
+                return HTTPConnection("127.0.0.1", server.server_port, timeout=timeout)
+
+            with patch("rotman_lt3.HTTPConnection", side_effect=connect), patch("builtins.input", return_value="team"), patch("rotman_lt3.getpass", return_value="pass"):
+                venue = RITVenue(None, True, mode="dma")
+            try:
+                desk = Desk(venue, "rit", Path(folder))
+                desk.poll()
+                self.assertEqual(mock.authorization, "Basic dGVhbTpwYXNz")
+                self.assertEqual(desk.state()["connection"], "dma")
+                desk.command("arm", {"api_orders_enabled": True})
+                desk.poll()
+                self.assertEqual(mock.writes[0], ("POST", "/v1/tenders/3", {"price": ["9.85"]}))
+                desk.poll()
+                self.assertEqual(mock.writes[1][1], "/v1/orders")
+            finally:
+                venue.close()
+
     def test_both_sides_fill_and_reconcile(self):
         for side, cap, action in (("BUY", 25_000, "SELL"), ("SELL", 10_000, "BUY")):
             with self.subTest(side=side):
@@ -236,7 +318,7 @@ class DashboardTests(unittest.TestCase):
                     conn.request("GET", "/")
                     page = conn.getresponse()
                     self.assertEqual(page.status, 200)
-                    self.assertIn(b"Apply strategy", page.read())
+                    self.assertIn(b"Apply changes", page.read())
                     payload = json.dumps(dict(asdict(Strategy()), adverse_move=Decimal("0.02")), default=str)
                     headers = {"Content-Type": "application/json"}
                     conn.request("POST", "/api/strategy", payload, headers)

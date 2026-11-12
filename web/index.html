@@ -1,299 +1,168 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Rotman LT3 Trading Desk</title>
-    <link rel="stylesheet" href="/desk.css" />
-    <script src="/desk.js" defer></script>
-  </head>
-  <body>
-    <header class="mast">
-      <div class="mast-inner">
-        <div class="brand">
-          <div class="brand-mark" aria-hidden="true">LT</div>
-          <div>
-            <h1>Rotman LT3</h1>
-            <p>Liability trading desk</p>
-          </div>
-        </div>
-        <div class="mast-status">
-          <span class="mode" id="mode">Connecting</span
-          ><span class="feed"
-            ><i id="feed-dot"></i><span id="feed">Waiting for data</span></span
-          >
-        </div>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LT3 Operator Desk</title>
+  <link rel="stylesheet" href="/desk.css">
+  <script src="/desk.js" defer></script>
+</head>
+<body>
+  <header class="mast">
+    <div class="shell mast-inner">
+      <a class="brand" href="/" aria-label="LT3 Operator Desk home">
+        <span class="mark" aria-hidden="true">LT<span>3</span></span>
+        <span><strong>Operator Desk</strong><small>Rotman liability trading</small></span>
+      </a>
+      <div class="mast-meta">
+        <span class="pill" id="connection">Connecting</span>
+        <span class="pill" id="recording" hidden>Recording</span>
+        <span class="feed"><i id="feed-dot"></i><span id="feed">Waiting for data</span></span>
       </div>
-    </header>
+    </div>
+  </header>
+  <main class="shell desk">
+    <section class="session" aria-label="Heat controls">
+      <div class="clock">
+        <div><p class="eyebrow" id="case-name">Rotman LT3</p><strong id="timer">—</strong><span id="tick">Heat clock</span></div>
+        <progress id="progress" max="300" value="0" aria-label="Heat progress"></progress>
+      </div>
+      <div class="controls">
+        <div class="control-row">
+          <span class="pill mode" id="engine">Entries paused</span>
+          <fieldset class="segments" aria-label="Entry mode">
+            <legend class="sr-only">Entry mode</legend>
+            <label><input type="radio" name="entry-mode" value="review" checked><span>Review</span></label>
+            <label><input type="radio" name="entry-mode" value="auto"><span>Auto</span></label>
+          </fieldset>
+          <button id="arm" type="button" class="primary">Arm Review</button>
+          <button id="pause" type="button">Pause entries</button>
+          <button id="halt" type="button" class="danger">Take over in RIT</button>
+        </div>
+        <label class="ack" id="ack" hidden><input type="checkbox" id="api-ack"> API orders are enabled and permitted for this heat</label>
+        <p class="subtle" id="control-help"></p>
+      </div>
+    </section>
+    <div id="fault" class="notice danger" role="alert" hidden></div>
+    <div id="message" class="notice" role="status" hidden></div>
 
-    <main class="desk">
-      <section class="session" aria-label="Session and controls">
-        <div class="session-main">
-          <span class="label">SESSION</span>
-          <h2 id="case-name">Rotman LT3</h2>
-          <div class="timer">
-            <strong id="timer">—</strong><span id="tick">Heat clock</span>
+    <div class="board">
+      <div class="lane">
+        <section class="panel tender" aria-labelledby="tender-title">
+          <div class="panel-head">
+            <div><p class="eyebrow">Tender desk</p><h1 id="tender-title">Waiting for an offer</h1></div>
+            <span class="pill" id="tender-status">No tender</span>
           </div>
-          <progress
-            id="progress"
-            max="300"
-            value="0"
-            aria-label="Heat progress"
-          ></progress>
-        </div>
-        <div class="session-controls">
-          <span id="engine" class="state">Standby</span>
-          <div class="controls">
-            <button id="arm" class="primary">Arm entries</button
-            ><button id="pause">Pause entries</button
-            ><button id="halt" class="danger">Stop &amp; cancel</button
-            ><button id="reset" hidden>Reset after review</button>
+          <div class="tender-body">
+            <p class="subtle" id="tender-subtitle">Active offers will appear here.</p>
+            <div id="offer-details" hidden>
+              <div class="offer-grid">
+                <div><span>Stressed profit</span><strong id="stressed">—</strong></div>
+                <div><span>Visible profit</span><strong id="visible">—</strong></div>
+                <div><span>Offer expires in</span><strong id="expires">—</strong></div>
+              </div>
+              <div class="coverage">
+                <div><span>Stressed book coverage</span><strong id="depth">—</strong></div>
+                <progress id="depth-bar" max="100" value="0" aria-label="Stressed book coverage"></progress>
+                <p id="budget" class="subtle"></p>
+              </div>
+            </div>
+            <p class="decision-reason" id="decision-reason" hidden></p>
+            <div class="tender-actions" id="tender-actions" hidden>
+              <button type="button" class="primary" id="approve">Approve tender</button>
+              <button type="button" id="skip">Skip offer</button>
+            </div>
+            <label class="offer-picker" id="picker" hidden>Inspect another offer <select id="offer-select"></select></label>
           </div>
-          <label id="ack" hidden
-            ><input type="checkbox" id="api-ack" /> API Orders is enabled and
-            permitted for this heat</label
-          >
-          <p id="control-help" class="muted"></p>
-        </div>
-      </section>
-      <div id="fault" class="alert" role="alert" hidden></div>
-      <div id="message" role="status" class="message" hidden></div>
+        </section>
 
-      <div class="grid">
-        <div class="flow">
-          <section class="metrics" aria-label="Account metrics">
-            <article>
-              <span class="label">CRZY POSITION</span
-              ><strong id="position-crzy">—</strong
-              ><small id="quote-crzy">Mid —</small>
-            </article>
-            <article>
-              <span class="label">TAME POSITION</span
-              ><strong id="position-tame">—</strong
-              ><small id="quote-tame">Mid —</small>
-            </article>
-            <article>
-              <span class="label">MODEL REALISED P&amp;L</span
-              ><strong id="pnl">—</strong
-              ><small id="completed">Completed tenders</small>
-            </article>
-            <article>
-              <span class="label">WORKING ORDERS</span
-              ><strong id="orders">—</strong><small>One child at a time</small>
-            </article>
-          </section>
-          <section class="panel chart-panel" aria-labelledby="chart-title">
-            <div class="panel-head">
-              <div>
-                <h2 id="chart-title">Market tape</h2>
-                <p>Mid prices indexed to the first displayed tick</p>
-              </div>
-              <div class="legend">
-                <span><i></i> CRZY</span><span><i></i> TAME</span>
-              </div>
-            </div>
-            <canvas
-              id="chart"
-              role="img"
-              aria-label="Indexed mid-price chart for CRZY and TAME"
-            ></canvas>
-          </section>
-          <section class="panel" aria-labelledby="tender-title">
-            <div class="panel-head">
-              <div>
-                <h2 id="tender-title">Tender queue</h2>
-                <p>Full-block exit value after fees</p>
-              </div>
-              <span class="count" id="tender-count">0 pending</span>
-            </div>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th scope="col">Offer</th>
-                    <th scope="col">Expires</th>
-                    <th scope="col">Visible</th>
-                    <th scope="col">Stressed</th>
-                    <th scope="col">Decision</th>
-                  </tr>
-                </thead>
-                <tbody id="tenders"></tbody>
-              </table>
-            </div>
-          </section>
-          <section class="panel" aria-labelledby="activity-title">
-            <div class="panel-head">
-              <div>
-                <h2 id="activity-title">Execution activity</h2>
-                <p>Orders, fills, cancellations and strategy changes</p>
-              </div>
-            </div>
-            <ul class="activity" id="events"></ul>
-          </section>
-        </div>
+        <section class="panel" aria-labelledby="activity-title">
+          <div class="panel-head"><h2 id="activity-title">Execution log</h2></div>
+          <ul id="events" class="events"></ul>
+        </section>
 
-        <aside class="flow">
-          <section class="panel strategy" aria-labelledby="strategy-title">
-            <div class="panel-head">
-              <div>
-                <h2 id="strategy-title">Strategy</h2>
-                <p id="revision">Revision 1</p>
-              </div>
-              <button id="restore" type="button" class="compact">
-                Revert edits
-              </button>
+        <details class="panel secondary" id="market-tape">
+          <summary>Market tape <small>Indexed CRZY and TAME mid prices</small></summary>
+          <div class="chart-wrap">
+            <p class="legend"><span>● CRZY</span><span>● TAME</span></p>
+            <canvas id="chart" role="img" aria-label="Indexed mid-price chart for CRZY and TAME"></canvas>
+          </div>
+        </details>
+      </div>
+
+      <div class="lane">
+        <section class="panel inventory" aria-labelledby="inventory-title">
+          <div class="panel-head">
+            <div><p class="eyebrow">Position and exit</p><h2 id="inventory-title">Checking account</h2></div>
+            <span class="pill" id="order-count">— orders</span>
+          </div>
+          <div class="inventory-body">
+            <p class="subtle" id="exit-detail"></p>
+            <div id="exit-progress" hidden>
+              <div class="exit-count"><strong id="exit-remaining">—</strong><span>shares still to exit</span></div>
+              <progress id="exit-bar" max="100" value="0" aria-label="Confirmed unwind progress"></progress>
+              <p class="subtle" id="working"></p>
             </div>
+            <div class="position-grid">
+              <div><span>CRZY position</span><strong id="position-crzy">—</strong></div>
+              <div><span>TAME position</span><strong id="position-tame">—</strong></div>
+              <div><span>Model realised P&amp;L</span><strong id="pnl">—</strong><small id="completed"></small></div>
+            </div>
+            <button id="reset" type="button" hidden>Reset after reviewing RIT</button>
+          </div>
+        </section>
+
+        <section class="panel strategy" aria-labelledby="strategy-title">
+          <div class="panel-head"><div><p class="eyebrow">Adapt during the heat</p><h2 id="strategy-title">Strategy</h2></div><span class="pill" id="revision">Revision —</span></div>
+          <div class="strategy-body">
+            <p class="subtle" id="active-profile">Waiting for settings</p>
             <form id="strategy-form">
-              <fieldset>
-                <legend>Entry threshold</legend>
-                <div class="fields">
-                  <label
-                    >Depth removed <small>%</small
-                    ><input
-                      name="depth_haircut"
-                      type="number"
-                      min="0"
-                      max="90"
-                      required
-                  /></label>
-                  <label
-                    >Adverse move <small>$/share</small
-                    ><input
-                      name="adverse_move"
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.001"
-                      required
-                  /></label>
-                  <label
-                    >Minimum edge <small>$/share</small
-                    ><input
-                      name="min_edge"
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.001"
-                      required
-                  /></label>
-                  <label
-                    >Tender expiry buffer <small>ticks</small
-                    ><input
-                      name="decision_ticks"
-                      type="number"
-                      min="2"
-                      max="20"
-                      required
-                  /></label>
-                </div>
-              </fieldset>
-              <fieldset>
-                <legend>Unwind</legend>
-                <div class="fields">
-                  <label
-                    >Minimum time left <small>ticks</small
-                    ><input
-                      name="min_heat_ticks"
-                      type="number"
-                      min="5"
-                      max="150"
-                      required
-                  /></label>
-                  <label
-                    >Budget per child <small>ticks</small
-                    ><input
-                      name="ticks_per_child"
-                      type="number"
-                      min="1"
-                      max="20"
-                      required
-                  /></label>
-                  <label
-                    >Closeout reserve <small>ticks</small
-                    ><input
-                      name="exit_reserve_ticks"
-                      type="number"
-                      min="0"
-                      max="60"
-                      required
-                  /></label>
-                  <label
-                    >Limit price cushion <small>¢</small
-                    ><input
-                      name="limit_slippage_ticks"
-                      type="number"
-                      min="0"
-                      max="10"
-                      required
-                  /></label>
-                  <label class="wide"
-                    >Market closeout window <small>ticks · 0 turns it off</small
-                    ><input
-                      name="market_closeout_ticks"
-                      type="number"
-                      min="0"
-                      max="30"
-                      required
-                  /></label>
-                </div>
-              </fieldset>
-              <fieldset>
-                <legend>Fee model</legend>
-                <div class="fields">
-                  <label
-                    >Market fee <small>$/share</small
-                    ><input
-                      name="market_fee"
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.001"
-                      required
-                  /></label>
-                  <label
-                    >Tender fee <small>$/share</small
-                    ><input
-                      name="tender_fee"
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.001"
-                      required
-                  /></label>
-                </div>
-              </fieldset>
-              <div class="form-foot">
-                <button type="submit" class="primary" id="apply" disabled>
-                  Apply strategy
-                </button>
-                <p class="muted">
-                  Changes apply on the next decision. Working orders keep their
-                  submitted prices.
-                </p>
+              <div class="presets">
+                <button type="button" data-preset="defensive"><strong>Defensive entry</strong><small>Stress depth and prices more</small></button>
+                <button type="button" data-preset="early"><strong>Earlier exits</strong><small>Allow more time to get flat</small></button>
               </div>
-            </form>
-          </section>
-          <section class="panel rehearsal" id="rehearsal" hidden>
-            <div class="panel-head">
-              <div>
-                <h2>Rehearsal</h2>
-                <p>Synthetic market and fills</p>
+              <div id="draft" class="draft" hidden><strong>Proposed changes</strong><ul id="changes"></ul></div>
+              <details class="advanced">
+                <summary>Fine-tune strategy</summary>
+                <fieldset><legend>Entry</legend><div class="fields">
+                  <label>Depth removed (%)<input name="depth_haircut" type="number" min="0" max="90" required></label>
+                  <label>Adverse move ($/share)<input name="adverse_move" type="number" min="0" max="1" step="any" required></label>
+                  <label>Minimum edge ($/share)<input name="min_edge" type="number" min="0" max="1" step="any" required></label>
+                  <label>Expiry buffer (ticks)<input name="decision_ticks" type="number" min="2" max="20" required></label>
+                </div></fieldset>
+                <fieldset><legend>Exit</legend><div class="fields">
+                  <label>Minimum time left (ticks)<input name="min_heat_ticks" type="number" min="5" max="150" required></label>
+                  <label>Budget per order (ticks)<input name="ticks_per_child" type="number" min="1" max="20" required></label>
+                  <label>Exit reserve (ticks)<input name="exit_reserve_ticks" type="number" min="0" max="60" required></label>
+                  <label>Limit price cushion (¢)<input name="limit_slippage_ticks" type="number" min="0" max="10" required></label>
+                  <label class="wide">Market closeout window (ticks, 0 disables)<input name="market_closeout_ticks" type="number" min="0" max="30" required></label>
+                </div></fieldset>
+                <fieldset><legend>Fees</legend><div class="fields">
+                  <label>Market fee ($/share)<input name="market_fee" type="number" min="0" max="1" step="any" required></label>
+                  <label>Tender fee ($/share)<input name="tender_fee" type="number" min="0" max="1" step="any" required></label>
+                </div></fieldset>
+              </details>
+              <div class="strategy-actions">
+                <button type="submit" class="primary" id="apply" disabled>Apply changes</button>
+                <button type="button" id="restore" disabled>Discard edits</button>
               </div>
-            </div>
-            <form id="rehearsal-form">
-              <label
-                >Scenario<select name="scenario">
-                  <option>Normal</option>
-                  <option>Thin book</option>
-                  <option>Adverse jump and depth loss</option>
-                  <option>Overlapping tenders</option>
-                  <option>Late depth drought</option>
-                </select></label
-              ><button type="submit" id="restart">Restart heat</button>
+              <p class="subtle">Applied settings govern the next decision or order.</p>
             </form>
-          </section>
-        </aside>
+          </div>
+        </section>
+
+        <details class="panel secondary" id="rehearsal" hidden>
+          <summary>Rehearsal setup</summary>
+          <form class="rehearsal-form" id="rehearsal-form">
+            <label>Scenario <select name="scenario">
+              <option>Normal</option><option>Thin book</option><option>Adverse jump and depth loss</option>
+              <option>Overlapping tenders</option><option>Late depth drought</option>
+            </select></label>
+            <button type="submit" id="restart">Restart heat</button>
+          </form>
+        </details>
       </div>
-    </main>
-  </body>
+    </div>
+  </main>
+</body>
 </html>

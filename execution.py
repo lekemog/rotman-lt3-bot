@@ -57,8 +57,8 @@ def strategy_from_dict(data):
 
 
 class RITVenue(RITReader):
-    def __init__(self, port, enable_orders):
-        super().__init__("client", port)
+    def __init__(self, port, enable_orders, *, mode="client", dma_https=False):
+        super().__init__(mode, port, dma_https=dma_https)
         self.enable_orders = enable_orders
         self.next_submit = 0.0
 
@@ -82,7 +82,8 @@ class RITVenue(RITReader):
         return json.loads(body)
 
     def accept(self, tender):
-        return self.write("POST", f"tenders/{tender.id}")["success"] is True
+        params = {"price": format(tender.price, "f")} if self.connection_mode == "dma" else {}
+        return self.write("POST", f"tenders/{tender.id}", **params)["success"] is True
 
     def submit(self, ticker, side, qty, limit):
         params = dict(ticker=ticker, action=side, quantity=qty, type="MARKET" if limit is None else "LIMIT")
@@ -100,6 +101,7 @@ class RITVenue(RITReader):
 class DemoVenue:
     enable_orders = True
     next_submit = 0.0
+    connection_mode = "demo"
 
     def __init__(self):
         self.round = 0
@@ -203,13 +205,17 @@ class Desk:
         self.snapshot = None
         self.read_at = 0.0
         self.clock_at = 0.0
+        self.heat = 1
         self.status = "Connecting"
         self.armed = False
+        self.entry_mode = "auto"
         self.halted = False
         self.fault = ""
         self.inventory = None
         self.working = None
         self.attempted = set()
+        self.skipped = set()
+        self.approval = None
         self.pnl = ZERO
         self.completed = 0
         path = state_dir / "strategy.json"
@@ -225,66 +231,114 @@ class Desk:
         except OSError:
             pass  # Keep the on-screen log and existing unwind active if disk is unavailable.
 
-    def save_strategy(self, data):
+    def save_strategy(self, data, expected_revision=None):
         strategy = strategy_from_dict(data)
         with self.lock:
+            if expected_revision is not None and expected_revision != self.revision:
+                raise ValueError("The strategy changed in another tab. Revert edits to load the active revision.")
             path = self.state_dir / "strategy.json"
             temp = path.with_suffix(".tmp")
             temp.write_text(json.dumps(asdict(strategy), default=str, indent=2) + "\n", encoding="utf-8")
             temp.replace(path)
             self.strategy = strategy
             self.revision += 1
+            self.approval = None
             self.log("STRATEGY", f"Applied revision {self.revision}")
 
     def command(self, action, data):
         with self.lock:
             if action == "restart" and self.mode == "rehearsal":
                 self.venue.restart(data.get("scenario"))
+                self.heat += 1
                 self.armed = self.halted = False
                 self.fault = ""
                 self.snapshot = self.inventory = self.working = None
                 self.attempted.clear()
+                self.skipped.clear()
+                self.approval = None
                 self.history.clear()
                 self.pnl, self.completed = ZERO, 0
                 self.log("REHEARSAL", "Started a fresh heat")
                 return
             if action == "pause":
                 self.armed = False
+                self.approval = None
                 self.log("PAUSED", "New entries paused. Any managed position will continue unwinding.")
                 return
             if action == "halt":
                 self.armed = False
+                self.approval = None
                 self.halted = True
                 self.log("HALTED", "Only cancellation and reconciliation of the managed order remain enabled.")
                 return
-            fresh = self.snapshot and self.status == "ACTIVE" and time.monotonic() - self.read_at < 2
+            fresh = self.is_fresh()
             flat = fresh and not any(self.snapshot["positions"].values()) and not self.snapshot["open_orders"]
             if action == "reset":
                 if not flat:
                     raise ValueError("Confirm a flat account with no working orders in RIT first")
                 self.halted, self.fault = False, ""
                 self.inventory = self.working = None
+                self.approval = None
                 self.log("RESET", "Confirmed a flat account. Entries remain paused.")
                 return
             if action == "arm":
+                entry_mode = data.get("entry_mode", "auto")
+                if entry_mode not in ("auto", "review"):
+                    raise ValueError("Choose Review or Auto for tender entries")
                 if not self.venue.enable_orders:
                     raise ValueError("This RIT session is in monitor mode")
                 if self.mode == "rit" and data.get("api_orders_enabled") is not True:
                     raise ValueError("Confirm API Orders is enabled and automation is permitted for this heat")
                 if not flat or self.fault or self.halted or self.inventory:
                     raise ValueError("Arming requires a fresh, flat account with no fault or working order")
+                self.entry_mode = entry_mode
+                self.approval = None
                 self.armed = True
-                self.log("ARMED", "Automatic tender selection and unwind enabled")
+                message = "Waiting for operator approval on each tender" if entry_mode == "review" else "Automatic tender selection and unwind enabled"
+                self.log("ARMED", message)
+                return
+            if action in ("approve", "skip"):
+                self.review_tender(action, data, fresh, flat)
                 return
             raise ValueError("Unknown desk action")
 
+    def is_fresh(self):
+        return self.snapshot is not None and self.status == "ACTIVE" and time.monotonic() - self.read_at < 2
+
+    def review_tender(self, action, data, fresh, flat):
+        if not fresh or data.get("heat") != self.heat or data.get("period") != self.snapshot["period"]:
+            raise ValueError("This tender view is stale. Wait for the current heat to refresh.")
+        id_ = shares(data.get("tender_id"))
+        offer = next((item for item in self.decisions(self.snapshot) if item[2].get("tender_id") == id_), None)
+        if not offer or id_ in self.attempted or id_ in self.skipped:
+            raise ValueError("This tender is no longer available to review")
+        tender, decision, _ = offer
+        if action == "skip":
+            self.skipped.add(id_)
+            if self.approval and self.approval[0].id == id_:
+                self.approval = None
+            self.log("SKIPPED", f"Tender #{id_} ignored by the desk for this heat")
+            return
+        if not (self.armed and self.entry_mode == "review" and flat and not self.inventory
+                and not self.halted and not self.fault and not self.approval):
+            raise ValueError("Arm Review while flat to approve a tender")
+        if data.get("revision") != self.revision or not decision or decision.status != "ACCEPT":
+            raise ValueError("The tender no longer clears the active strategy. Review the updated quote.")
+        if (data.get("ticker"), data.get("side"), data.get("quantity"), decimal(data.get("price"))) != (
+                tender.ticker, tender.side, tender.quantity, tender.price):
+            raise ValueError("The tender terms changed. Review the updated offer.")
+        self.approval = (tender, time.monotonic() + 3)
+        self.log("APPROVED", f"Tender #{id_} queued for a fresh book check")
+
     def fail(self, message):
         self.armed = False
+        self.approval = None
         self.fault = message
         self.log("REVIEW IN RIT", message)
 
     def feed_error(self, message):
         with self.lock:
+            self.approval = None
             if self.armed:
                 self.armed = False
                 self.log("FEED", "Entries paused after a feed error")
@@ -304,6 +358,7 @@ class Desk:
                 return
             self.status = status
             if snapshot is None:
+                self.approval = None
                 if status in {"STOPPED", "PAUSED"}:
                     self.armed = False
                 return
@@ -317,8 +372,11 @@ class Desk:
                 self.feed_error("RIT case clock stopped advancing")
                 return
             if changed:
+                self.heat += 1
                 self.armed = False
                 self.attempted.clear()
+                self.skipped.clear()
+                self.approval = None
                 self.history.clear()
                 self.completed, self.pnl = 0, ZERO
                 if self.inventory or self.working:
@@ -375,7 +433,16 @@ class Desk:
             self.fail("Unmanaged position or working order. Clear it in RIT before arming.")
             return
         candidates = [(tender, decision) for tender, decision, _ in self.decisions(snapshot)
-                      if decision and decision.status == "ACCEPT" and tender.id not in self.attempted]
+                      if decision and decision.status == "ACCEPT"
+                      and tender.id not in self.attempted and tender.id not in self.skipped]
+        if self.entry_mode == "review":
+            if not self.approval:
+                return
+            approved, deadline = self.approval
+            self.approval = None
+            candidates = [item for item in candidates if item[0] == approved and now <= deadline]
+            if not candidates:
+                self.log("APPROVAL LAPSED", f"Tender #{approved.id} changed, expired or no longer clears the strategy")
         if not candidates:
             return
         tender, decision = max(candidates, key=lambda item: (item[1].stressed_pnl, -item[0].expires))
@@ -480,22 +547,40 @@ class Desk:
     def state(self):
         with self.lock:
             snap = self.snapshot
-            fresh = snap and self.status == "ACTIVE" and time.monotonic() - self.read_at < 2
+            fresh = self.is_fresh()
             tenders = []
             if fresh:
                 for tender, decision, raw in self.decisions(snap):
+                    id_ = raw.get("tender_id")
+                    if id_ in self.attempted or id_ in self.skipped:
+                        continue
                     if tender:
+                        budget = self.strategy.tender_settings(tender).min_heat_ticks
                         tenders.append(dict(id=tender.id, ticker=tender.ticker, side=tender.side,
                                             quantity=tender.quantity, price=tender.price, status=decision.status,
                                             reason=decision.reason, visible=decision.visible_pnl,
-                                            stressed=decision.stressed_pnl, depth=decision.stressed.filled,
+                                            stressed=decision.stressed_pnl, depth=decision.stressed.filled, budget=budget,
                                             remaining=max(0, tender.expires - snap["tick"])))
                     else:
-                        tenders.append(dict(id=raw.get("tender_id"), status="REVIEW",
+                        tenders.append(dict(id=id_, status="REVIEW",
                                             reason="Verify the offer in the RIT client"))
             quotes = self.history[-1] if self.history else {}
-            return dict(mode=self.mode, status=self.status, fresh=bool(fresh), armed=self.armed,
+            inventory = None
+            if self.inventory:
+                tender = self.inventory.tender
+                inventory = dict(id=tender.id, ticker=tender.ticker, quantity=tender.quantity,
+                                 remaining=abs(self.inventory.expected), exit_side=tender.exit_side,
+                                 confirmed=self.inventory.confirmed)
+            working = None
+            if self.working:
+                working = dict(id=self.working.id, quantity=self.working.quantity,
+                               cancelling=self.working.cancelled_at is not None)
+            return dict(mode=self.mode, connection=self.venue.connection_mode,
+                        status=self.status, fresh=bool(fresh), armed=self.armed,
                         order_enabled=self.venue.enable_orders, halted=self.halted, fault=self.fault,
+                        entry_mode=self.entry_mode, heat=self.heat, period=snap["period"] if snap else None,
+                        approval=self.approval[0].id if self.approval else None,
+                        inventory=inventory, working=working, recording=self.record and self.mode == "rit",
                         tick=snap["tick"] if snap else 0, end_tick=snap["end_tick"] if snap else 300,
                         case_name=snap["case_name"] if snap else "Rotman LT3", positions=snap["positions"] if snap else {},
                         open_orders=snap["open_orders"] if snap else 0, tenders=tenders, quotes=quotes,

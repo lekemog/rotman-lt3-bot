@@ -63,7 +63,7 @@ def handler_for(desk, port):
                 if not isinstance(data, dict):
                     raise ValueError("Expected a JSON object")
                 if self.path == "/api/strategy":
-                    desk.save_strategy(data)
+                    desk.save_strategy(data, expected_revision=data.pop("expected_revision", None))
                 elif self.path == "/api/command":
                     desk.command(data.get("action"), data)
                 else:
@@ -90,21 +90,28 @@ def poll_loop(desk, stop):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rit", action="store_true", help="Connect to the Windows RIT Client REST API")
+    connection = parser.add_mutually_exclusive_group()
+    connection.add_argument("--windows", "--rit", action="store_true", help="Use the Windows RIT Client REST API")
+    connection.add_argument("--mac", action="store_true", help="Use the Rotman DMA API on a MacBook")
     parser.add_argument("--enable-orders", action="store_true", help="Enable the arm control for RIT")
-    parser.add_argument("--rit-port", type=int, default=9999)
+    parser.add_argument("--rit-port", type=int, help="RIT port (Windows local default 9999, Mac practice default 16540)")
+    parser.add_argument("--dma-https", action="store_true", help="Use HTTPS when Rotman supplies a TLS DMA port")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--state-dir", type=Path, default=Path(".rotman"))
     parser.add_argument("--record", action="store_true", help="Record RIT snapshots locally for replay")
     parser.add_argument("--no-open", action="store_true", help="Leave opening the browser to the operator")
     args = parser.parse_args()
-    if args.enable_orders and not args.rit:
-        parser.error("Use --enable-orders with --rit. Rehearsal can be armed from the dashboard.")
-    if not all(1 <= port <= 65535 for port in (args.port, args.rit_port)):
+    live = args.windows or args.mac
+    if args.enable_orders and not live:
+        parser.error("Use --enable-orders with --windows or --mac. Rehearsal can be armed from the dashboard.")
+    if args.dma_https and not args.mac:
+        parser.error("Use --dma-https with --mac")
+    if not 1 <= args.port <= 65535 or (args.rit_port is not None and not 1 <= args.rit_port <= 65535):
         parser.error("Use port numbers between 1 and 65535")
     args.state_dir.mkdir(parents=True, exist_ok=True)
-    venue = RITVenue(args.rit_port, args.enable_orders) if args.rit else DemoVenue()
-    desk = Desk(venue, "rit" if args.rit else "rehearsal", args.state_dir, args.record)
+    venue = RITVenue(args.rit_port, args.enable_orders, mode="dma" if args.mac else "client",
+                     dma_https=args.dma_https) if live else DemoVenue()
+    desk = Desk(venue, "rit" if live else "rehearsal", args.state_dir, args.record)
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(desk, args.port)) as server:
         stop = Event()
         worker = Thread(target=poll_loop, args=(desk, stop), daemon=True)

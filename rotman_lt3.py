@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from getpass import getpass
-from http.client import HTTPConnection, HTTPException
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 import json
 from pathlib import Path
 import re
@@ -231,12 +231,14 @@ class RateLimited(Exception):
 
 
 class RITReader:
-    def __init__(self, mode, port):
+    def __init__(self, mode, port=None, *, dma_https=False):
+        self.connection_mode = mode
         if mode == "client":
-            self.connection = HTTPConnection("127.0.0.1", port, timeout=2)
+            self.connection = HTTPConnection("127.0.0.1", port or 9999, timeout=2)
             self.headers = {"X-API-Key": getpass("RIT Client API key: ")}
         else:
-            self.connection = HTTPConnection("flserver.rotman.utoronto.ca", 16540, timeout=2)
+            connect = HTTPSConnection if dma_https else HTTPConnection
+            self.connection = connect("flserver.rotman.utoronto.ca", port or 16540, timeout=2)
             credentials = f"{input('RIT Trader ID: ')}:{getpass('RIT password: ')}"
             self.headers = {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode()}
 
@@ -392,7 +394,7 @@ def self_test():
 
 
 def watch(args, settings):
-    client = RITReader(args.mode, args.local_port)
+    client = RITReader(args.mode, args.local_port if args.mode == "client" else None)
     record = args.record.open("x", encoding="utf-8") if args.record else None
     try:
         while True:
