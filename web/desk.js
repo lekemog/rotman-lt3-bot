@@ -38,22 +38,18 @@ function applyForm(strategy) {
 }
 
 function updateButtons() {
-  const armBlocked =
-    !state?.fresh ||
-    !state.order_enabled ||
-    state.armed ||
-    state.halted ||
-    state.fault ||
-    state.open_orders ||
-    Object.values(state.positions).some(Boolean) ||
+  const blocked =
+    writing ||
+    !state?.order_enabled ||
     draft ||
     (state.mode === "rit" && !byId("api-ack").checked);
-  byId("arm").disabled = Boolean(writing || armBlocked);
-  byId("pause").disabled = Boolean(writing || !state?.armed);
+  byId("arm").disabled = Boolean(blocked || state.armed);
+  byId("unwind").disabled = Boolean(
+    blocked || (state.unwinding && !state.armed),
+  );
   byId("halt").disabled = Boolean(
     writing || !state?.order_enabled || state.halted,
   );
-  byId("reset").disabled = writing;
   byId("apply").disabled = writing || !draft;
   byId("restore").disabled = writing || !draft;
   byId("restart").disabled = writing;
@@ -95,33 +91,30 @@ function render(next) {
   byId("progress").value = state.tick;
   text(
     "engine",
-    state.fault
-      ? "REVIEW IN RIT"
-      : state.halted
-        ? "STOPPED"
-        : state.armed
-          ? "ARMED"
-          : "ENTRIES PAUSED",
+    state.halted
+      ? "STOPPED"
+      : state.armed
+        ? "ARMED"
+        : state.unwinding
+          ? "UNWIND ONLY"
+          : "STANDBY",
   );
   byId("engine").classList.toggle("armed", state.armed);
-  byId("engine").classList.toggle(
-    "halted",
-    state.halted || Boolean(state.fault),
-  );
-  byId("reset").hidden = !state.halted && !state.fault;
+  byId("engine").classList.toggle("halted", state.halted);
   byId("ack").hidden = !live || !state.order_enabled || state.armed;
-  if (!state.fresh) byId("api-ack").checked = false;
-  byId("fault").hidden = !state.fault;
-  text("fault", state.fault);
+  byId("fault").hidden = !state.alert;
+  text("fault", state.alert);
   text(
     "control-help",
     live && !state.order_enabled
       ? "Monitor mode uses the RIT data feed."
       : state.halted
-        ? "Check remaining positions and orders in RIT."
+        ? "Stopped. Any remaining inventory is yours to manage in RIT, or press Unwind only."
         : state.armed
-          ? "The desk unwinds confirmed tender inventory."
-          : "Pausing entries lets an existing unwind finish.",
+          ? "Accepting tenders that pass the model and flattening every position."
+          : state.unwinding
+            ? "You accept or decline in RIT. The desk flattens whatever position RIT reports."
+            : "Standing by. Nothing is sent to RIT until you arm.",
   );
   byId("rehearsal").hidden = live;
   for (const ticker of ["CRZY", "TAME"]) {
@@ -134,13 +127,18 @@ function render(next) {
       `Mid ${state.fresh ? money(state.quotes[ticker]) : "—"}`,
     );
   }
-  text("pnl", money(state.pnl));
-  tone(byId("pnl"), state.pnl);
+  text("pnl", money(state.nlv));
+  tone(byId("pnl"), state.nlv);
+  const fines = Number(state.fines) ? ` · fines ${money(state.fines)}` : "";
   text(
     "completed",
-    `${state.completed} completed ${state.completed === 1 ? "tender" : "tenders"}`,
+    `${state.nlv_change == null ? "—" : money(state.nlv_change)} since attach · ${state.accepted} accepted${fines}`,
   );
   text("orders", state.fresh ? number(state.open_orders) : "—");
+  const rules = Object.entries(state.rules)
+    .map(([ticker, rule]) => `${ticker} ${number(rule.cap)} @ ${money(rule.fee)}`)
+    .join(" · ");
+  text("rules", rules ? `Max order and fee: ${rules}` : "One child per ticker");
   text("revision", `Revision ${state.revision}`);
   if (!draft && lastRevision !== state.revision) applyForm(state.strategy);
   lastRevision = state.revision;
@@ -182,9 +180,16 @@ function renderTenders(tenders) {
     tone(visible, tender.visible);
     tone(stressed, tender.stressed);
     const decision = node("td");
+    const edge =
+      tender.edge == null ? "" : ` · ${Number(tender.edge).toFixed(1)}¢/share`;
+    const netted = tender.netted ? ` · nets ${number(tender.netted)}` : "";
     decision.append(
-      node("span", tender.status, `decision ${tender.status.toLowerCase()}`),
-      node("small", tender.reason),
+      node(
+        "span",
+        tender.taken ? "SENT" : tender.status,
+        `decision ${tender.status.toLowerCase()}`,
+      ),
+      node("small", `${tender.reason}${edge}${netted}`),
     );
     row.append(
       offer,
@@ -284,7 +289,6 @@ async function send(path, payload, success) {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error);
     if (path === "/api/strategy") applyForm(data.strategy);
-    if (payload.action === "arm") byId("api-ack").checked = false;
     render(data);
     showMessage(success);
   } catch (error) {
@@ -313,14 +317,13 @@ byId("restore").addEventListener("click", () => {
 });
 byId("api-ack").addEventListener("change", updateButtons);
 for (const [button, action, message] of [
-  ["arm", "arm", "Entries armed"],
-  ["pause", "pause", "New entries paused"],
+  ["arm", "arm", "Armed. Tenders and unwinds are automatic."],
+  ["unwind", "unwind", "Unwind only. Tender decisions are yours."],
   [
     "halt",
     "halt",
     "Desk stopped. Check the RIT blotter for any remaining inventory.",
   ],
-  ["reset", "reset", "Desk reset"],
 ]) {
   byId(button).addEventListener("click", () => {
     send(

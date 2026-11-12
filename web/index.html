@@ -44,10 +44,9 @@
         <div class="session-controls">
           <span id="engine" class="state">Standby</span>
           <div class="controls">
-            <button id="arm" class="primary">Arm entries</button
-            ><button id="pause">Pause entries</button
-            ><button id="halt" class="danger">Stop &amp; cancel</button
-            ><button id="reset" hidden>Reset after review</button>
+            <button id="arm" class="primary">Arm auto-trade</button
+            ><button id="unwind">Unwind only</button
+            ><button id="halt" class="danger">Stop &amp; cancel</button>
           </div>
           <label id="ack" hidden
             ><input type="checkbox" id="api-ack" /> API Orders is enabled and
@@ -73,13 +72,14 @@
               ><small id="quote-tame">Mid —</small>
             </article>
             <article>
-              <span class="label">MODEL REALISED P&amp;L</span
+              <span class="label">RIT NET LIQUID VALUE</span
               ><strong id="pnl">—</strong
-              ><small id="completed">Completed tenders</small>
+              ><small id="completed">Since the desk attached</small>
             </article>
             <article>
               <span class="label">WORKING ORDERS</span
-              ><strong id="orders">—</strong><small>One child at a time</small>
+              ><strong id="orders">—</strong
+              ><small id="rules">One child per ticker</small>
             </article>
           </section>
           <section class="panel chart-panel" aria-labelledby="chart-title">
@@ -102,7 +102,10 @@
             <div class="panel-head">
               <div>
                 <h2 id="tender-title">Tender queue</h2>
-                <p>Full-block exit value after fees</p>
+                <p>
+                  Change in book value if accepted, after fees and inventory
+                  already held
+                </p>
               </div>
               <span class="count" id="tender-count">0 pending</span>
             </div>
@@ -112,8 +115,8 @@
                   <tr>
                     <th scope="col">Offer</th>
                     <th scope="col">Expires</th>
-                    <th scope="col">Visible</th>
-                    <th scope="col">Stressed</th>
+                    <th scope="col">Sweep now</th>
+                    <th scope="col">Model</th>
                     <th scope="col">Decision</th>
                   </tr>
                 </thead>
@@ -145,7 +148,7 @@
             </div>
             <form id="strategy-form">
               <fieldset>
-                <legend>Entry threshold</legend>
+                <legend>Entry model</legend>
                 <div class="fields">
                   <label
                     >Depth removed <small>%</small
@@ -167,6 +170,15 @@
                       required
                   /></label>
                   <label
+                    >Book refill per child <small>%</small
+                    ><input
+                      name="refill"
+                      type="number"
+                      min="0"
+                      max="100"
+                      required
+                  /></label>
+                  <label
                     >Minimum edge <small>$/share</small
                     ><input
                       name="min_edge"
@@ -174,6 +186,16 @@
                       min="0"
                       max="1"
                       step="0.001"
+                      required
+                  /></label>
+                  <label
+                    >Patience <small>σ of the window left</small
+                    ><input
+                      name="patience"
+                      type="number"
+                      min="0"
+                      max="5"
+                      step="0.1"
                       required
                   /></label>
                   <label
@@ -188,7 +210,7 @@
                 </div>
               </fieldset>
               <fieldset>
-                <legend>Unwind</legend>
+                <legend>Time budget</legend>
                 <div class="fields">
                   <label
                     >Minimum time left <small>ticks</small
@@ -218,6 +240,29 @@
                       required
                   /></label>
                   <label
+                    >Market closeout window <small>ticks · 0 is off</small
+                    ><input
+                      name="market_closeout_ticks"
+                      type="number"
+                      min="0"
+                      max="60"
+                      required
+                  /></label>
+                </div>
+              </fieldset>
+              <fieldset>
+                <legend>Unwind</legend>
+                <div class="fields">
+                  <label
+                    >Sweep band per child <small>¢</small
+                    ><input
+                      name="sweep_band"
+                      type="number"
+                      min="1"
+                      max="200"
+                      required
+                  /></label>
+                  <label
                     >Limit price cushion <small>¢</small
                     ><input
                       name="limit_slippage_ticks"
@@ -227,12 +272,12 @@
                       required
                   /></label>
                   <label class="wide"
-                    >Market closeout window <small>ticks · 0 turns it off</small
+                    >Rest unfilled remainder <small>ms</small
                     ><input
-                      name="market_closeout_ticks"
+                      name="rest_ms"
                       type="number"
-                      min="0"
-                      max="30"
+                      min="200"
+                      max="5000"
                       required
                   /></label>
                 </div>
@@ -241,7 +286,7 @@
                 <legend>Fee model</legend>
                 <div class="fields">
                   <label
-                    >Market fee <small>$/share</small
+                    >Market fee <small>$/share · RIT value wins</small
                     ><input
                       name="market_fee"
                       type="number"
@@ -284,10 +329,15 @@
               <label
                 >Scenario<select name="scenario">
                   <option>Normal</option>
+                  <option>Slow refill</option>
                   <option>Thin book</option>
+                  <option>Volatile</option>
                   <option>Adverse jump and depth loss</option>
+                  <option>Slow polling</option>
                   <option>Overlapping tenders</option>
+                  <option>Opposing tenders</option>
                   <option>Late depth drought</option>
+                  <option>Fee on both legs</option>
                 </select></label
               ><button type="submit" id="restart">Restart heat</button>
             </form>

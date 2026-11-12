@@ -7,7 +7,8 @@ from pathlib import Path
 from threading import Event, Thread
 import webbrowser
 
-from execution import DemoVenue, Desk, RITVenue
+from execution import Desk, RITVenue
+from simulator import SimVenue
 from rotman_lt3 import RateLimited
 
 
@@ -77,14 +78,16 @@ def handler_for(desk, port):
     return Handler
 
 
-def poll_loop(desk, stop):
+def poll_loop(desk, stop, interval):
     while not stop.is_set():
         try:
             desk.poll()
-            delay = 0.55
+            delay = interval
         except RateLimited as error:
-            desk.feed_error("RIT rate limit · waiting for a fresh snapshot")
-            delay = error.wait
+            delay = min(2.0, error.wait)
+        except Exception as error:  # Keep the unwind alive through anything unexpected.
+            desk.log("ERROR", f"{type(error).__name__}: {error}")
+            delay = interval
         stop.wait(delay)
 
 
@@ -95,19 +98,22 @@ def main():
     parser.add_argument("--rit-port", type=int, default=9999)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--state-dir", type=Path, default=Path(".rotman"))
-    parser.add_argument("--record", action="store_true", help="Record RIT snapshots locally for replay")
+    parser.add_argument("--record", action="store_true", help="Record snapshots under the state directory for calibrate.py")
     parser.add_argument("--no-open", action="store_true", help="Leave opening the browser to the operator")
+    parser.add_argument("--interval", type=float, default=0.4, help="Seconds between RIT polls")
     args = parser.parse_args()
     if args.enable_orders and not args.rit:
         parser.error("Use --enable-orders with --rit. Rehearsal can be armed from the dashboard.")
     if not all(1 <= port <= 65535 for port in (args.port, args.rit_port)):
         parser.error("Use port numbers between 1 and 65535")
+    if not 0.1 <= args.interval <= 5:
+        parser.error("Use a poll interval between 0.1 and 5 seconds")
     args.state_dir.mkdir(parents=True, exist_ok=True)
-    venue = RITVenue(args.rit_port, args.enable_orders) if args.rit else DemoVenue()
+    venue = RITVenue(args.rit_port, args.enable_orders) if args.rit else SimVenue(speed=1.5, start_tick=15)
     desk = Desk(venue, "rit" if args.rit else "rehearsal", args.state_dir, args.record)
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(desk, args.port)) as server:
         stop = Event()
-        worker = Thread(target=poll_loop, args=(desk, stop), daemon=True)
+        worker = Thread(target=poll_loop, args=(desk, stop, args.interval), daemon=True)
         worker.start()
         url = f"http://127.0.0.1:{args.port}"
         print(f"Rotman LT3 desk · {url}", flush=True)
@@ -121,8 +127,8 @@ def main():
             stop.set()
             worker.join(timeout=3)
             venue.close()
-            if desk.inventory or desk.working:
-                print("Execution was active. Check positions and working orders directly in RIT.")
+            if desk.legs or (desk.snapshot and any(desk.snapshot["positions"].values())):
+                print("The desk stopped with inventory or a working order. Check RIT directly.")
 
 
 if __name__ == "__main__":

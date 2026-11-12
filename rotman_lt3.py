@@ -1,15 +1,14 @@
-"""Tender decision support for the RITCxDublin 2026 liability trading case.
+"""Tender model for the RITCxDublin 2026 liability trading case.
 
 Python 3.10+, standard library only. Start with `python rotman_lt3.py demo`.
 Use `watch client --record practice.jsonl` with the Windows RIT Client running
 and its REST API enabled. `watch dma` uses the published Dublin practice port.
 `replay practice.jsonl` re-evaluates recorded snapshots with the chosen settings.
 
-Watch and replay advise on one tender at a time. Accept, decline and unwind in
-the RIT interface. Only unwind after acceptance and the position are confirmed.
-Use the CLI fee settings to match the practice transaction log. By default the
-model charges $0.02 per market share and assumes no separate tender commission.
-The stress settings are starting assumptions, to be calibrated from practice.
+The model answers one question per tender: how much better or worse off is the
+book if this block is added to the inventory already held? A tender that offsets
+inventory is worth the market exit it saves. A tender that adds inventory is
+worth its price against a child-by-child walk of the exit side of the book.
 """
 
 import argparse
@@ -53,13 +52,24 @@ def shares(value):
 
 @dataclass(frozen=True)
 class Settings:
-    market_fee: Decimal = Decimal("0.02")
+    # Entry model
+    market_fee: Decimal = Decimal("0.02")  # Used when RIT does not report a fee.
     tender_fee: Decimal = ZERO
-    depth_haircut: int = 10
-    adverse_move: Decimal = CENT
-    min_edge: Decimal = ZERO
+    depth_haircut: int = 10        # % of displayed depth assumed to vanish.
+    adverse_move: Decimal = CENT   # $/share the exit side is assumed to slip.
+    refill: int = 50               # % of consumed depth assumed back by the next child.
+    min_edge: Decimal = ZERO       # Required model profit, $/share of the tender.
+    patience: Decimal = Decimal(1) # Extra edge to act early, in sigmas of the mid over the window left.
+    decision_ticks: int = 3        # Never accept this close to tender expiry.
+    # Time budget
     min_heat_ticks: int = 20
-    decision_ticks: int = 2
+    ticks_per_child: int = 3
+    exit_reserve_ticks: int = 10
+    # Unwind
+    sweep_band: int = 5            # Cents through the touch one child may take.
+    limit_slippage_ticks: int = 1  # Cents of cushion on a fully covered child.
+    rest_ms: int = 800             # How long an unfilled remainder rests.
+    market_closeout_ticks: int = 12
 
 
 @dataclass(frozen=True)
@@ -96,10 +106,10 @@ class Sweep:
 class Decision:
     status: str
     reason: str
-    visible: Sweep
-    stressed: Sweep
-    visible_pnl: Decimal | None
-    stressed_pnl: Decimal | None
+    visible_pnl: Decimal | None   # One immediate sweep of the displayed book.
+    stressed_pnl: Decimal | None  # The entry model. Decisions use this figure.
+    exit_quantity: int            # Shares left to unwind in this ticker if accepted.
+    netted: int                   # Shares of the tender that offset inventory.
 
 
 @dataclass(frozen=True)
@@ -107,11 +117,16 @@ class ChildOrder:
     ticker: str
     side: str
     quantity: int
-    limit: Decimal
+    limit: Decimal | None  # None is a market order.
 
 
-def parse_tender(raw):
-    """Resolve the ticker and our side from the offer shown to the trader."""
+def parse_tender(raw, mid=None):
+    """Resolve the ticker and our side of the offer.
+
+    The caption is what the trader is asked, so an unambiguous caption decides.
+    The API `action` field is used when the caption cannot be read, and only if
+    the price is on the favourable side of the market for that reading.
+    """
     caption = raw.get("caption") or ""
     ticker_tokens = set(re.findall(r"\b(?:CRZY|TAME)\b", caption.upper()))
     ticker = raw.get("ticker")
@@ -119,8 +134,14 @@ def parse_tender(raw):
         ticker = next(iter(ticker_tokens))
     if ticker not in CAP or ticker_tokens - {ticker}:
         raise ValueError("Tender ticker is missing or ambiguous")
+    if raw.get("is_fixed_bid") is not True:
+        raise ValueError("Expected a fixed-price tender")
+    quantity = abs(shares(raw["quantity"]))
+    price = decimal(raw["price"])
+    if quantity == 0 or price <= 0:
+        raise ValueError("Expected a positive tender size and price")
 
-    trader_sides = {word.upper() for word in re.findall(
+    sides = {word.upper() for word in re.findall(
         r"\b(?:would you like|do you want)\s+to\s+(buy|sell)\b", caption, re.I
     )}
     institution_sides = re.findall(
@@ -128,106 +149,234 @@ def parse_tender(raw):
         r"(?:would like to|wants to|is offering to|has offered to|will|wishes to)\s+"
         r"(buy|sell)\b", caption, re.I
     )
-    trader_sides.update("SELL" if word.upper() == "BUY" else "BUY"
-                        for word in institution_sides)
-    if len(trader_sides) != 1:
+    sides.update("SELL" if word.upper() == "BUY" else "BUY" for word in institution_sides)
+    if len(sides) > 1:
         raise ValueError("Confirm BUY/SELL in the RIT tender dialog")
-
-    if raw.get("is_fixed_bid") is not True:
-        raise ValueError("Expected a fixed-price tender")
-    quantity = abs(shares(raw["quantity"]))
-    price = decimal(raw["price"])
-    if quantity == 0 or price <= 0:
-        raise ValueError("Expected a positive tender size and price")
-    return Tender(shares(raw["tender_id"]), ticker, trader_sides.pop(), quantity,
-                  price, shares(raw["expires"]), shares(raw["period"]))
+    if sides:
+        side = sides.pop()
+    else:
+        side = str(raw.get("action") or "").upper()
+        mids = mid or {}
+        reference = mids.get(ticker)
+        if side not in ("BUY", "SELL") or reference is None or (side == "BUY") != (price < reference):
+            raise ValueError("Confirm BUY/SELL in the RIT tender dialog")
+    return Tender(shares(raw["tender_id"]), ticker, side, quantity, price,
+                  shares(raw["expires"]), shares(raw["period"]))
 
 
 def exit_levels(book, exit_side):
     """Aggregate unfilled order quantities at each price, best price first."""
     prices = defaultdict(int)
     selling = exit_side == "SELL"
-    for row in book["bids" if selling else "asks"]:
-        left = shares(row["quantity"]) - shares(row["quantity_filled"])
+    rows = book.get("bids", book.get("bid")) if selling else book.get("asks", book.get("ask"))
+    for row in rows or ():
+        left = shares(row["quantity"]) - shares(row.get("quantity_filled") or 0)
         price = decimal(row["price"])
         if left > 0 and price > 0:
             prices[price] += left
     return sorted(prices.items(), reverse=selling)
 
 
-def sweep(levels, quantity, exit_side, haircut=0, adverse_move=ZERO):
-    """Walk exactly the required shares, including a partial last price level."""
-    filled, value, worst = 0, ZERO, None
-    for price, available in levels:
-        if filled == quantity:
+def mid_price(book):
+    bids, asks = exit_levels(book, "SELL"), exit_levels(book, "BUY")
+    return (bids[0][0] + asks[0][0]) / 2 if bids and asks else None
+
+
+def sweep(levels, quantity, exit_side, haircut=0, adverse_move=ZERO, cap=None, refill=0):
+    """Walk the exit side child by child.
+
+    Each child takes at most `cap` shares. Liquidity taken by earlier children
+    leaves a hole at the top of the book, and `refill` percent of that hole is
+    back before the next child. With refill 0 this is one sweep of the book.
+    """
+    cap = cap or quantity
+    levels = [(price, size * (100 - haircut) // 100) for price, size in levels]
+    filled, value, worst, hole = 0, ZERO, None, 0
+    while filled < quantity:
+        child = min(cap, quantity - filled)
+        hole = hole * (100 - refill) // 100
+        skip, got = hole, 0
+        for price, available in levels:
+            if skip >= available:
+                skip -= available
+                continue
+            take = min(child - got, available - skip)
+            skip = 0
+            stressed = price - adverse_move if exit_side == "SELL" else price + adverse_move
+            if stressed <= 0:
+                break
+            got += take
+            value += take * stressed
+            worst = stressed
+            if got == child:
+                break
+        filled += got
+        hole += got
+        if got < child:
             break
-        available = available * (100 - haircut) // 100
-        take = min(quantity - filled, available)
-        stressed_price = price - adverse_move if exit_side == "SELL" else price + adverse_move
-        if take > 0 and stressed_price > 0:
-            filled += take
-            value += take * stressed_price
-            worst = stressed_price
     return Sweep(filled, value, worst)
 
 
+def flatten_value(position, levels, cap, fee, haircut, adverse_move, refill, extend):
+    """Model cash from flattening a signed position, after market fees.
+
+    `extend` prices shares beyond the displayed depth at the worst displayed
+    price. It is used for inventory already held, where it understates the cost
+    of the exit and therefore understates the benefit of a netting tender.
+    """
+    quantity = abs(position)
+    if not quantity:
+        return ZERO
+    side = "SELL" if position > 0 else "BUY"
+    walk = sweep(levels, quantity, side, haircut, adverse_move, cap, refill)
+    value = walk.value
+    if walk.filled < quantity:
+        if not extend or walk.worst_price is None:
+            return None
+        value += (quantity - walk.filled) * walk.worst_price
+    return (value if position > 0 else -value) - quantity * fee
+
+
+def rules_for(snapshot, ticker, settings):
+    rules = (snapshot.get("rules") or {}).get(ticker) or {}
+    cap = shares(rules.get("cap") or 0) or CAP[ticker]
+    fee = decimal(rules["fee"]) if rules.get("fee") is not None else settings.market_fee
+    return cap, fee
+
+
 def evaluate(tender, snapshot, settings):
-    levels = exit_levels(snapshot["books"][tender.ticker], tender.exit_side)
-    visible = sweep(levels, tender.quantity, tender.exit_side)
-    stressed = sweep(levels, tender.quantity, tender.exit_side,
-                     settings.depth_haircut, settings.adverse_move)
-    entry_value = tender.price * tender.quantity
-    fees = tender.quantity * (settings.market_fee + settings.tender_fee)
-    visible_pnl = (tender.direction * (visible.value - entry_value) - fees
-                   if visible.filled == tender.quantity else None)
-    stressed_pnl = (tender.direction * (stressed.value - entry_value) - fees
-                    if stressed.filled == tender.quantity else None)
-    decision = Decision("WAIT", "", visible, stressed, visible_pnl, stressed_pnl)
+    ticker = tender.ticker
+    positions = snapshot["positions"]
+    current = positions[ticker]
+    new = current + tender.direction * tender.quantity
+    netted = max(0, abs(current) - abs(new)) if current * tender.direction < 0 else 0
+    cap, fee = rules_for(snapshot, ticker, settings)
+    cash = -tender.direction * tender.quantity * tender.price - tender.quantity * settings.tender_fee
+
+    def change(haircut, adverse, refill):
+        book = snapshot["books"][ticker]
+        after = flatten_value(new, exit_levels(book, "SELL" if new > 0 else "BUY"),
+                              cap, fee, haircut, adverse, refill, extend=False)
+        before = flatten_value(current, exit_levels(book, "SELL" if current > 0 else "BUY"),
+                               cap, fee, haircut, adverse, refill, extend=True)
+        return None if after is None or before is None else cash + after - before
+
+    visible = change(0, ZERO, 0)
+    stressed = change(settings.depth_haircut, settings.adverse_move, settings.refill)
+    decision = Decision("WAIT", "", visible, stressed, abs(new), netted)
 
     tick = snapshot["tick"]
-    if tender.period != snapshot["period"] or tender.expires <= tick:
+    left = tender.expires - tick
+    if tender.period != snapshot["period"] or left <= 0:
         return replace(decision, status="EXPIRED", reason="Tender window closed")
-    if tender.expires - tick <= settings.decision_ticks:
+    if left <= settings.decision_ticks:
         return replace(decision, status="PASS", reason="Tender at expiry buffer")
-    if snapshot["end_tick"] - tick <= settings.min_heat_ticks:
+    children = (abs(new) + cap - 1) // cap
+    budget = max(settings.min_heat_ticks,
+                 settings.exit_reserve_ticks + settings.ticks_per_child * children)
+    if new and abs(new) > abs(current) and snapshot["end_tick"] - tick <= budget:
         return replace(decision, status="PASS", reason="Heat closeout window")
 
-    positions = snapshot["positions"]
+    limits = snapshot.get("limits") or {}
     projected = dict(positions)
-    projected[tender.ticker] += tender.direction * tender.quantity
-    if abs(sum(projected.values())) > NET_LIMIT or sum(map(abs, projected.values())) > GROSS_LIMIT:
+    projected[ticker] = new
+    if (abs(sum(projected.values())) > (limits.get("net") or NET_LIMIT)
+            or sum(map(abs, projected.values())) > (limits.get("gross") or GROSS_LIMIT)):
         return replace(decision, reason="Projected net or gross limit exceeded")
-    if any(positions.values()) or snapshot["open_orders"]:
-        return replace(decision, reason="Clear existing inventory and working orders first")
-    if stressed_pnl is None:
-        return replace(decision, reason="Stressed depth cannot cover the block")
-    if stressed_pnl <= settings.min_edge * tender.quantity:
-        return replace(decision, reason="Stressed P&L below acceptance threshold")
-    return replace(decision, status="ACCEPT", reason="Full stressed unwind clears fees and edge")
+    if stressed is None:
+        return replace(decision, reason="Displayed depth cannot cover the exit")
+    if stressed <= tender.quantity * settings.min_edge:
+        return replace(decision, reason="Model P&L below the acceptance threshold")
+    # The tender is a free option until it expires and the mid has no drift, so
+    # a thin edge is worth more held than exercised. Act early only when the edge
+    # is already large against how far the mid can travel in the time left.
+    window = max(0, min(left - settings.decision_ticks, snapshot["end_tick"] - tick - budget) - 1)
+    sigma = decimal((snapshot.get("sigma") or {}).get(ticker) or 0)
+    if not netted and stressed <= tender.quantity * (
+            settings.min_edge + settings.patience * sigma * Decimal(window).sqrt()):
+        return replace(decision, reason="Profitable now, holding the option for a better entry")
+    reason = "Offsets inventory" if netted == tender.quantity else (
+        "Offsets inventory, exit clears fees" if netted else "Modelled exit clears fees and edge")
+    return replace(decision, status="ACCEPT", reason=reason)
 
 
-def next_unwind(confirmed_tender, position, book, open_orders):
-    """Suggest one marketable limit for confirmed inventory from a flat start.
+def evaluate_all(snapshot, settings):
+    """Evaluate every live tender, then look for opposing pairs.
 
-    Recheck fills and position before asking for another slice. A partially
-    filled limit can rest in the book. Cancel and confirm any remainder before
-    asking again. This function only describes an order.
+    Two offers on opposite sides of one ticker can lock a spread between two
+    institutions with little or no market exit. The first leg of such a pair can
+    fail the model on its own, so it is accepted on the strength of the pair.
+    Returns (tender, decision, raw) rows. Unreadable offers come back as
+    (None, None, raw).
     """
-    if open_orders or position * confirmed_tender.direction <= 0:
+    reference = mids(snapshot)
+    rows = []
+    for raw in snapshot["tenders"]:
+        try:
+            tender = parse_tender(raw, reference)
+            rows.append([tender, evaluate(tender, snapshot, settings), raw])
+        except (ValueError, KeyError, TypeError, ArithmeticError):
+            rows.append([None, None, raw])
+    for row in rows:
+        first, alone, _ = row
+        if (not first or alone.status != "WAIT" or alone.stressed_pnl is None
+                or not alone.reason.startswith(("Model", "Profitable"))):
+            continue
+        positions = dict(snapshot["positions"])
+        positions[first.ticker] += first.direction * first.quantity
+        held = dict(snapshot, positions=positions)
+        best = None
+        for second, _, _ in rows:
+            if (second and second.ticker == first.ticker and second.side != first.side
+                    and second.expires - snapshot["tick"] > settings.decision_ticks + 2):
+                follow = evaluate(second, held, settings)
+                if follow.status == "ACCEPT" and (best is None or follow.stressed_pnl > best[1]):
+                    best = second, follow.stressed_pnl
+        if best and alone.stressed_pnl + best[1] > settings.min_edge * (first.quantity + best[0].quantity):
+            row[1] = replace(alone, status="ACCEPT", stressed_pnl=alone.stressed_pnl + best[1],
+                             reason=f"Pairs with #{best[0].id} on the other side")
+    return [tuple(row) for row in rows]
+
+
+def plan_child(ticker, position, book, cap, band, cushion, urgent):
+    """Describe one inventory-reducing marketable limit order.
+
+    A patient child takes the displayed liquidity within `band` of the touch and
+    rests any remainder at the last price it took. An urgent child is priced to
+    take the whole chunk from the displayed book.
+    """
+    if not position:
         return None
-    if abs(position) > confirmed_tender.quantity:
-        raise ValueError("Position exceeds confirmed tender inventory")
-    ticker = confirmed_tender.ticker
-    side = confirmed_tender.exit_side
-    quote = sweep(exit_levels(book, side), min(abs(position), CAP[ticker]), side)
-    if quote.filled == 0:
+    side = "SELL" if position > 0 else "BUY"
+    quantity = min(abs(position), cap)
+    levels = exit_levels(book, side)
+    if not levels:
         return None
-    return ChildOrder(ticker, side, quote.filled, quote.worst_price)
+    worse = -1 if side == "SELL" else 1
+    best = levels[0][0]
+    bound = None if urgent else best + worse * band
+    reached, limit = 0, best
+    for price, available in levels:
+        if bound is not None and (price - bound) * worse > 0:
+            break
+        limit = price
+        reached += available
+        if reached >= quantity:
+            break
+    if reached >= quantity or urgent:
+        limit += worse * cushion
+        if bound is not None and (limit - bound) * worse > 0:
+            limit = bound
+    return ChildOrder(ticker, side, quantity, max(CENT, limit))
 
 
 class RateLimited(Exception):
     def __init__(self, wait):
         self.wait = wait
+
+
+class Rejected(RuntimeError):
+    """RIT refused the request, so nothing was changed."""
 
 
 class RITReader:
@@ -239,12 +388,13 @@ class RITReader:
             self.connection = HTTPConnection("flserver.rotman.utoronto.ca", 16540, timeout=2)
             credentials = f"{input('RIT Trader ID: ')}:{getpass('RIT password: ')}"
             self.headers = {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode()}
+        self.limits = None, {}
 
-    def get(self, endpoint, **params):
+    def request(self, method, endpoint, **params):
         path = f"/v1/{endpoint}"
         if params:
             path += "?" + urlencode(params)
-        self.connection.request("GET", path, headers=self.headers)
+        self.connection.request(method, path, headers=self.headers)
         response = self.connection.getresponse()
         body = response.read()
         if response.status == 429:
@@ -253,10 +403,28 @@ class RITReader:
                 wait = float(decimal(wait))
             except (ValueError, ArithmeticError, KeyError, TypeError):
                 wait = 1.0
-            raise RateLimited(max(0.25, wait))
+            raise RateLimited(max(0.05, wait))
+        if 400 <= response.status < 500:
+            raise Rejected(f"RIT refused {method} {endpoint} with HTTP {response.status}")
         if response.status != 200:
-            raise RuntimeError(f"RIT {endpoint} returned HTTP {response.status}")
-        return json.loads(body)
+            raise RuntimeError(f"RIT {method} {endpoint} returned HTTP {response.status}")
+        return json.loads(body), response
+
+    def get(self, endpoint, **params):
+        return self.request("GET", endpoint, **params)[0]
+
+    def case_limits(self, period):
+        if self.limits[0] != period:
+            found = {}
+            try:
+                rows = self.get("limits")
+                net = min((shares(row["net_limit"]) for row in rows if row.get("net_limit")), default=0)
+                gross = min((shares(row["gross_limit"]) for row in rows if row.get("gross_limit")), default=0)
+                found = {key: value for key, value in (("net", net), ("gross", gross)) if value > 0}
+            except (Rejected, ValueError, KeyError, TypeError, ArithmeticError):
+                pass  # The case brief limits apply.
+            self.limits = period, found
+        return self.limits[1]
 
     def snapshot(self, depth):
         started = time.monotonic()
@@ -264,19 +432,33 @@ class RITReader:
         if before["status"] != "ACTIVE":
             return before["status"], None
 
-        positions = {row["ticker"]: shares(row["position"]) for row in self.get("securities")}
-        if set(positions) != set(CAP):
+        securities = {row["ticker"]: row for row in self.get("securities")}
+        if set(securities) != set(CAP):
             raise RuntimeError("Expected exactly the Dublin case tickers CRZY and TAME")
-        open_orders = self.get("orders", status="OPEN")
+        positions = {ticker: shares(securities[ticker]["position"]) for ticker in CAP}
+        rules = {}
+        for ticker in CAP:
+            row = securities[ticker]
+            rules[ticker] = dict(cap=shares(row.get("max_trade_size") or 0))
+            if row.get("trading_fee") is not None:
+                rules[ticker]["fee"] = str(decimal(row["trading_fee"]))
+            if row.get("limit_order_rebate") is not None:
+                rules[ticker]["rebate"] = str(decimal(row["limit_order_rebate"]))
+        orders = [dict(id=shares(order["order_id"]), ticker=order["ticker"], action=order["action"],
+                       quantity=shares(order["quantity"]), filled=shares(order.get("quantity_filled") or 0),
+                       price=order.get("price"))
+                  for order in self.get("orders", status="OPEN")]
         tenders = self.get("tenders")
         books = {}
         for ticker in CAP:
             book = self.get("securities/book", ticker=ticker, limit=depth)
             books[ticker] = {
-                side: [{field: order[field] for field in ("price", "quantity", "quantity_filled")}
-                       for order in book[side]]
-                for side in ("bids", "asks")
+                name: [{field: order.get(field, 0) for field in ("price", "quantity", "quantity_filled")}
+                       for order in book.get(name, book.get(name[:-1])) or ()]
+                for name in ("bids", "asks")
             }
+        trader = self.get("trader")
+        limits = self.case_limits(shares(before["period"]))
         after = self.get("case")
         tick = shares(after["tick"])
         period = shares(after["period"])
@@ -285,36 +467,30 @@ class RITReader:
                 or time.monotonic() - started > 1.5):
             return "SNAPSHOT TOO OLD OR HEAT CHANGED", None
 
-        fields = ("tender_id", "ticker", "period", "expires", "caption",
+        fields = ("tender_id", "ticker", "period", "tick", "expires", "caption", "action",
                   "is_fixed_bid", "price", "quantity")
         return "ACTIVE", dict(tick=tick, period=period, end_tick=shares(after["ticks_per_period"]),
                               case_name=after.get("name", "RIT"), positions=positions, books=books,
-                              open_orders=len(open_orders),
-                              open_order_ids=[shares(order["order_id"]) for order in open_orders],
+                              rules=rules, limits=limits, orders=orders, open_orders=len(orders),
+                              nlv=trader.get("nlv"), fines=trader.get("total_fines"),
                               tenders=[{key: row[key] for key in fields if key in row} for row in tenders])
 
 
-def report(snapshot, settings):
-    results = []
-    for raw in snapshot["tenders"]:
-        try:
-            tender = parse_tender(raw)
-            results.append((tender, evaluate(tender, snapshot, settings)))
-        except (ValueError, ArithmeticError, KeyError, TypeError) as error:
-            print(f"  Tender {raw.get('tender_id', '?')}: REVIEW IN RIT ({error})")
+def mids(snapshot):
+    return {ticker: mid_price(book) for ticker, book in snapshot["books"].items()}
 
-    best = max((item for item in results if item[1].status == "ACCEPT"),
-               key=lambda item: (item[1].stressed_pnl, -item[0].expires), default=None)
-    for tender, decision in results:
-        if decision.status == "ACCEPT" and tender != best[0]:
-            decision = replace(decision, status="WAIT", reason="Another tender has higher stressed P&L")
-        visible = money(decision.visible_pnl)
-        stressed = money(decision.stressed_pnl)
-        vwap = "—" if decision.visible.vwap is None else f"${decision.visible.vwap:.4f}"
+
+def report(snapshot, settings):
+    for tender, decision, raw in evaluate_all(snapshot, settings):
+        if tender is None:
+            print(f"  Tender {raw.get('tender_id', '?')}: REVIEW IN RIT")
+            continue
+        per_share = ("—" if decision.stressed_pnl is None
+                     else f"{decision.stressed_pnl / tender.quantity * 100:+.1f}¢/sh")
         print(f"  #{tender.id} {tender.ticker} {tender.side} {tender.quantity:,} @ ${tender.price:.2f}"
               f" | {decision.status} — {decision.reason}"
-              f" | exit VWAP {vwap} | visible {visible} | stressed {stressed}"
-              f" | stressed depth {decision.stressed.filled:,}/{tender.quantity:,}"
+              f" | sweep now {money(decision.visible_pnl)} | model {money(decision.stressed_pnl)} ({per_share})"
+              f" | to unwind {decision.exit_quantity:,} | netted {decision.netted:,}"
               f" | expiry {max(0, tender.expires - snapshot['tick'])} ticks")
 
 
@@ -332,62 +508,121 @@ def demo_snapshot():
     book = {side: [dict(price=p, quantity=q, quantity_filled=0) for p, q in levels]
             for side, levels in (("bids", bids), ("asks", asks))}
     snapshot = dict(period=1, tick=100, end_tick=300, positions=dict(CRZY=0, TAME=0),
-                    open_orders=0, books=dict(CRZY=book, TAME=book), tenders=[])
+                    open_orders=0, orders=[], books=dict(CRZY=book, TAME=book), tenders=[])
     for id_, price in enumerate(("9.90", "9.97", "9.85"), 1):
         snapshot["tenders"].append(dict(tender_id=id_, period=1, expires=125,
-                                       caption="An institution would like to sell CRZY to you."
-                                               " Would you like to BUY the shares?",
+                                       caption="An institution would like to SELL 50,000 shares of CRZY"
+                                               f" to you at a price of ${price}. Would you like to BUY"
+                                               " the shares from them?",
                                        is_fixed_bid=True, price=price, quantity=50_000))
     return snapshot
 
 
 def demo(settings):
     snapshot = demo_snapshot()
-    print("Independent tender examples at tick 100. The $9.85 offer is synthetic.")
+    print("The case brief's book at tick 100. The brief accepts $9.90 and declines $9.97."
+          " The $9.85 offer is synthetic.")
     for tender in snapshot["tenders"]:
         report(dict(snapshot, tenders=[tender]), settings)
-    strong_tender = parse_tender(snapshot["tenders"][-1])
-    child = next_unwind(strong_tender, 50_000, snapshot["books"]["CRZY"], open_orders=0)
-    print(f"Example after confirmed $9.85 acceptance: {child.side} {child.quantity:,}"
-          f" {child.ticker} at a limit of ${child.limit:.2f}, then check fills and remaining position.")
+    held = dict(snapshot, positions=dict(CRZY=50_000, TAME=0), tenders=[dict(
+        tender_id=4, period=1, expires=125, is_fixed_bid=True, price="10.02", quantity=40_000,
+        caption="An institution would like to BUY 40,000 shares of CRZY from you at a price of $10.02."
+                " Would you like to SELL the shares to them?")])
+    print("Long 50,000 CRZY, then an institution bids for 40,000:")
+    report(held, settings)
+    child = plan_child("CRZY", 50_000, snapshot["books"]["CRZY"], CAP["CRZY"],
+                       CENT * settings.sweep_band, CENT * settings.limit_slippage_ticks, urgent=False)
+    print(f"First unwind child for a 50,000 long: {child.side} {child.quantity:,} {child.ticker}"
+          f" at a limit of ${child.limit:.2f}.")
 
 
 def self_test():
     snapshot = demo_snapshot()
     settings = Settings()
-    long, poor, strong = map(parse_tender, snapshot["tenders"])
-    quote = evaluate(long, snapshot, settings)
-    assert quote.visible.vwap == Decimal("9.9338")
-    assert quote.visible_pnl == Decimal("690") and quote.stressed_pnl == Decimal("-279")
-    assert evaluate(long, snapshot, replace(settings, tender_fee=CENT * 2)).visible_pnl == Decimal("-310")
-    assert evaluate(poor, snapshot, settings).visible_pnl == Decimal("-2810")
+    accept, decline, strong = (parse_tender(raw) for raw in snapshot["tenders"])
+    levels = exit_levels(snapshot["books"]["CRZY"], "SELL")
+    assert sweep(levels, 50_000, "SELL").vwap == Decimal("9.9338")
+    assert sweep(levels, 50_000, "SELL", cap=25_000, refill=0) == sweep(levels, 50_000, "SELL")
+    assert sweep(levels, 50_000, "SELL", cap=25_000, refill=100).value == 2 * sweep(levels, 25_000, "SELL").value
+    assert sweep(levels, 90_000, "SELL").filled == 65_000
+
+    quote = evaluate(accept, snapshot, settings)
+    assert quote.visible_pnl == Decimal("690") and quote.stressed_pnl == Decimal("796")
+    assert quote.status == "ACCEPT" and quote.exit_quantity == 50_000 and quote.netted == 0
+    assert evaluate(decline, snapshot, settings).status == "WAIT"
+    assert evaluate(decline, snapshot, settings).visible_pnl == Decimal("-2810")
     assert evaluate(strong, snapshot, settings).status == "ACCEPT"
+    full_sweep = replace(settings, refill=0)
+    assert evaluate(accept, snapshot, full_sweep).stressed_pnl == Decimal("-279")
+    assert evaluate(accept, snapshot, replace(settings, tender_fee=CENT * 2)).status == "WAIT"
+    volatile = dict(snapshot, sigma=dict(CRZY="0.02"))
+    assert evaluate(accept, volatile, settings).reason.startswith("Profitable now")
+    assert evaluate(accept, volatile, replace(settings, patience=ZERO)).status == "ACCEPT"
+    assert evaluate(strong, volatile, replace(settings, patience=Decimal("0.5"))).status == "ACCEPT"
+    assert evaluate(replace(accept, expires=104), volatile, settings).status == "ACCEPT"
+    assert evaluate(accept, dict(snapshot, rules=dict(CRZY=dict(cap=25_000, fee="0.05"))), settings).status == "WAIT"
+
     short = replace(strong, side="SELL", ticker="TAME", quantity=6_000, price=Decimal("10.10"))
     assert evaluate(short, snapshot, settings).visible_pnl == Decimal("450")
     assert evaluate(replace(short, quantity=54_000), snapshot, settings).visible_pnl is None
     assert evaluate(replace(strong, quantity=100_001), snapshot, settings).reason.startswith("Projected")
     gross_case = dict(snapshot, positions=dict(CRZY=130_000, TAME=-120_000))
     assert evaluate(strong, gross_case, settings).reason.startswith("Projected")
-    assert evaluate(strong, dict(snapshot, tick=123), settings).status == "PASS"
+    assert evaluate(strong, dict(snapshot, limits=dict(net=40_000)), settings).reason.startswith("Projected")
+    assert evaluate(strong, dict(snapshot, tick=122), settings).status == "PASS"
     assert evaluate(replace(strong, expires=300), dict(snapshot, tick=280), settings).status == "PASS"
-    assert evaluate(strong, dict(snapshot, open_orders=1), settings).status == "WAIT"
-    assert evaluate(strong, dict(snapshot, positions=dict(CRZY=0, TAME=1)), settings).status == "WAIT"
+    assert evaluate(replace(strong, period=2), snapshot, settings).status == "EXPIRED"
+
+    # A tender against inventory is worth the market exit it saves.
+    long = dict(snapshot, positions=dict(CRZY=50_000, TAME=0))
+    offset = replace(strong, side="SELL", quantity=50_000, price=Decimal("9.96"))
+    netting = evaluate(offset, dict(long, sigma=dict(CRZY="0.50")), settings)
+    assert netting.status == "ACCEPT" and netting.netted == 50_000 and netting.exit_quantity == 0
+    assert evaluate(replace(offset, expires=300), dict(long, tick=295), settings).status == "ACCEPT"
+    assert evaluate(replace(offset, price=Decimal("9.80")), long, settings).status == "WAIT"
+    assert evaluate(strong, dict(snapshot, positions=dict(CRZY=60_000, TAME=0)), settings).reason.startswith("Projected")
+
+    # Neither leg of this pair clears the model alone. Together they lock 4c a share.
+    pair = dict(snapshot, tenders=[
+        dict(snapshot["tenders"][1], tender_id=8, price="9.96"),
+        dict(snapshot["tenders"][1], tender_id=9, price="10.00",
+             caption="An institution would like to BUY 50,000 shares of CRZY from you at a price of $10.00."
+                     " Would you like to SELL the shares to them?")])
+    (buy, first, _), (sell, second, _) = evaluate_all(pair, settings)
+    assert evaluate(buy, pair, settings).status == evaluate(sell, pair, settings).status == "WAIT"
+    assert first.status == "ACCEPT" and first.reason == "Pairs with #9 on the other side"
+    assert first.stressed_pnl == second.stressed_pnl == Decimal("2000") and second.status == "ACCEPT"
+
     book = snapshot["books"]["CRZY"]
-    assert next_unwind(strong, 50_000, book, 0) == ChildOrder("CRZY", "SELL", 25_000, Decimal("9.95"))
-    assert next_unwind(short, -3_000, book, 0) == ChildOrder("TAME", "BUY", 3_000, Decimal("10.00"))
-    assert next_unwind(strong, -5_000, book, 0) is None
-    assert next_unwind(strong, 5_000, book, 1) is None
+    patient = plan_child("CRZY", 50_000, book, 25_000, CENT * 5, CENT, urgent=False)
+    assert patient == ChildOrder("CRZY", "SELL", 25_000, Decimal("9.94"))
+    assert plan_child("CRZY", 50_000, book, 25_000, CENT * 2, CENT, False).limit == Decimal("9.98")
+    assert plan_child("CRZY", 50_000, book, 50_000, CENT * 5, CENT, True).limit == Decimal("9.87")
+    assert plan_child("TAME", -3_000, book, 10_000, CENT * 5, CENT, False) == ChildOrder(
+        "TAME", "BUY", 3_000, Decimal("10.01"))
+    assert plan_child("TAME", -30_000, book, 10_000, CENT * 5, CENT, False).limit == Decimal("10.03")
+    assert plan_child("CRZY", 0, book, 25_000, CENT, CENT, False) is None
+    assert plan_child("CRZY", 5_000, dict(bids=[], asks=[]), 25_000, CENT, CENT, True) is None
     order = dict(price="9.99", quantity=10_000, quantity_filled=9_000)
     assert exit_levels(dict(bids=book["bids"] + [order]), "SELL")[0] == (Decimal("9.99"), 1_000)
-    raw = dict(snapshot["tenders"][0], ticker="CRZY", action="BUY", quantity=-50_000,
+    assert exit_levels(dict(bid=book["bids"]), "SELL") == levels
+
+    raw = dict(snapshot["tenders"][0], ticker="CRZY", quantity=-50_000, price="10.05",
                caption="An institution would like to BUY CRZY. Would you like to SELL the shares?")
     assert parse_tender(raw).side == "SELL"
-    for caption in ("CRZY", "An institution would like to BUY CRZY. Would you like to BUY the shares?"):
+    try:
+        parse_tender(dict(raw, caption="An institution would like to BUY CRZY. Would you like to BUY the shares?"))
+        raise AssertionError("A contradictory caption should be reviewed manually")
+    except ValueError:
+        pass
+    bare = dict(raw, caption="CRZY block", action="SELL")
+    assert parse_tender(bare, dict(CRZY=Decimal("9.99"))).side == "SELL"
+    for reference in (None, dict(CRZY=Decimal("10.20"))):
         try:
-            parse_tender(dict(raw, caption=caption))
+            parse_tender(bare, reference)
+            raise AssertionError("An unreadable caption needs a favourable price to trust the action field")
         except ValueError:
-            continue
-        raise AssertionError("Ambiguous offer should be reviewed manually")
+            pass
     print("LT3 self-test passed.")
 
 
@@ -402,7 +637,7 @@ def watch(args, settings):
                 print(f"Rate limited. Recommendations paused for {error.wait:.2f}s.", flush=True)
                 time.sleep(error.wait)
                 continue
-            except (OSError, HTTPException) as error:
+            except (OSError, HTTPException, RuntimeError) as error:
                 client.connection.close()
                 print(f"Connection interrupted. Recommendations paused ({error}).", flush=True)
                 time.sleep(args.interval)
@@ -416,7 +651,7 @@ def watch(args, settings):
                       f" | {snapshot['open_orders']} working orders", flush=True)
                 report(snapshot, settings)
                 if record:
-                    record.write(json.dumps(snapshot) + "\n")
+                    record.write(json.dumps(snapshot, default=str) + "\n")
                     record.flush()
             time.sleep(args.interval)
     finally:
@@ -429,11 +664,13 @@ def add_settings(parser):
     parser.add_argument("--market-fee", type=decimal, default=Settings.market_fee)
     parser.add_argument("--tender-fee", type=decimal, default=Settings.tender_fee)
     parser.add_argument("--depth-haircut", type=int, default=Settings.depth_haircut,
-                        help="Percent of displayed depth removed in the stress case")
+                        help="Percent of displayed depth removed in the model")
     parser.add_argument("--adverse-move", type=decimal, default=Settings.adverse_move,
-                        help="Stress price move in dollars per share")
+                        help="Model price slip in dollars per share")
+    parser.add_argument("--refill", type=int, default=Settings.refill,
+                        help="Percent of consumed depth assumed back before the next child")
     parser.add_argument("--min-edge", type=decimal, default=Settings.min_edge,
-                        help="Required stressed profit in dollars per share")
+                        help="Required model profit in dollars per share")
     parser.add_argument("--min-heat-ticks", type=int, default=Settings.min_heat_ticks)
     parser.add_argument("--decision-ticks", type=int, default=Settings.decision_ticks)
 
@@ -451,18 +688,21 @@ def main():
     watch_parser.add_argument("--record", type=Path, help="New JSONL file for practice snapshots")
     watch_parser.add_argument("--interval", type=decimal, default=Decimal("1.0"))
     watch_parser.add_argument("--local-port", type=int, default=9999)
-    watch_parser.add_argument("--book-depth", type=int, default=50)
+    watch_parser.add_argument("--book-depth", type=int, default=200)
     add_settings(watch_parser)
     args = parser.parse_args()
     if args.command == "self-test":
         self_test()
         return
 
-    settings = Settings(args.market_fee, args.tender_fee, args.depth_haircut, args.adverse_move,
-                        args.min_edge, args.min_heat_ticks, args.decision_ticks)
-    if not 0 <= settings.depth_haircut < 100 or min(settings.market_fee, settings.tender_fee,
-            settings.adverse_move, settings.min_edge, settings.min_heat_ticks, settings.decision_ticks) < 0:
-        parser.error("Use non-negative settings and a depth haircut below 100%")
+    settings = Settings(market_fee=args.market_fee, tender_fee=args.tender_fee,
+                        depth_haircut=args.depth_haircut, adverse_move=args.adverse_move,
+                        refill=args.refill, min_edge=args.min_edge,
+                        min_heat_ticks=args.min_heat_ticks, decision_ticks=args.decision_ticks)
+    if (not 0 <= settings.depth_haircut < 100 or not 0 <= settings.refill <= 100
+            or min(settings.market_fee, settings.tender_fee, settings.adverse_move, settings.min_edge,
+                   settings.min_heat_ticks, settings.decision_ticks) < 0):
+        parser.error("Use non-negative settings, a depth haircut below 100% and a refill of 0 to 100%")
     if args.command == "watch" and (args.interval < Decimal("0.25") or args.book_depth < 1
                                     or not 1 <= args.local_port <= 65535):
         parser.error("Use an interval of at least 0.25s, positive depth and a valid local port")
