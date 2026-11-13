@@ -1,5 +1,5 @@
 import contextlib
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -338,6 +338,57 @@ class ExecutionTests(unittest.TestCase):
             self.assertEqual(desk.state()["tenders"][0]["reason"], "Heat closeout window")
             desk.poll()
             self.assertEqual(mock.writes, [])
+
+
+class TuningTests(unittest.TestCase):
+    def test_reconciled_child_is_followed_on_the_same_poll(self):
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True})
+            desk.poll()                  # Accept.
+            desk.poll()                  # Child 1 fills 5,000 and rests.
+            desk.working.sent_at -= 1
+            desk.poll()                  # Cancel the remainder.
+            self.assertEqual(len(mock.orders), 1)
+            desk.poll()                  # Reconcile child 1 and send child 2.
+            self.assertEqual(len(mock.orders), 2)
+            desk.poll()                  # Reconcile child 2 and send child 3.
+            self.assertEqual(len(mock.orders), 3)
+            desk.poll()
+            self.assertEqual(desk.completed, 1)
+            self.assertFalse(any(mock.positions.values()) or desk.fault)
+
+    def test_sweep_band_limits_a_child_until_time_is_short(self):
+        for tick, quantity, price in ((100, "8000", "9.97"), (280, "25000", "9.94")):
+            with self.subTest(tick=tick):
+                mock = MockRIT()
+                mock.tenders[0]["expires"] = 299
+                with rit_desk(mock) as desk:
+                    desk.strategy = replace(Strategy(), sweep_band=2)
+                    desk.poll()
+                    desk.command("arm", {"api_orders_enabled": True})
+                    desk.poll()
+                    mock.case["tick"] = tick
+                    desk.poll()
+                    order = next(args for verb, path, args in mock.writes if path == "/v1/orders")
+                    self.assertEqual((order["quantity"], order["price"]), ([quantity], [price]))
+
+    def test_profile_from_an_earlier_version_keeps_its_values(self):
+        with TemporaryDirectory() as folder:
+            directory = Path(folder)
+            venue = DemoVenue()
+            try:
+                earlier = dict(asdict(Strategy()), adverse_move="0.03", depth_haircut=6, ticks_per_child=6)
+                del earlier["refill"], earlier["sweep_band"]
+                (directory / "strategy.json").write_text(json.dumps(earlier, default=str), encoding="utf-8")
+                strategy = Desk(venue, "rehearsal", directory).strategy
+                self.assertEqual((strategy.adverse_move, strategy.depth_haircut), (Decimal("0.03"), 6))
+                self.assertEqual((strategy.refill, strategy.sweep_band), (0, 0))
+                (directory / "strategy.json").write_text("[1, 2", encoding="utf-8")
+                self.assertEqual(Desk(venue, "rehearsal", directory).strategy, Strategy())
+            finally:
+                venue.close()
 
 
 class DashboardTests(unittest.TestCase):

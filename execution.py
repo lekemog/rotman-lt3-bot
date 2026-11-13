@@ -26,6 +26,7 @@ class Strategy(Settings):
     exit_reserve_ticks: int = 10
     limit_slippage_ticks: int = 1
     market_closeout_ticks: int = 0
+    sweep_band: int = 0  # Cents through the touch one child may take. 0 sweeps the full chunk.
 
     def tender_settings(self, tender):
         chunks = (tender.quantity + CAP[tender.ticker] - 1) // CAP[tender.ticker]
@@ -38,7 +39,7 @@ STRATEGY_FIELDS = {
     "market_fee": (0, 1), "tender_fee": (0, 1), "decision_ticks": (2, 20),
     "min_heat_ticks": (5, 150), "ticks_per_child": (1, 20),
     "exit_reserve_ticks": (0, 60), "limit_slippage_ticks": (0, 10),
-    "market_closeout_ticks": (0, 30),
+    "market_closeout_ticks": (0, 30), "refill": (0, 100), "sweep_band": (0, 50),
 }
 
 
@@ -217,7 +218,15 @@ class Desk:
         self.completed = 0
         path = state_dir / "strategy.json"
         if path.exists():
-            self.strategy = strategy_from_dict(json.loads(path.read_text(encoding="utf-8")))
+            # A profile saved by an earlier version lacks the newer settings.
+            # Those take their defaults, which leave the earlier behaviour as it was.
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+                defaults = asdict(Strategy())
+                self.strategy = strategy_from_dict(
+                    {name: saved.get(name, defaults[name]) for name in STRATEGY_FIELDS})
+            except (OSError, ValueError, TypeError, AttributeError, ArithmeticError):
+                self.log("STRATEGY", "The saved profile could not be read. Defaults loaded.")
 
     def log(self, event, message):
         row = dict(time=time.strftime("%H:%M:%S"), event=event, message=message)
@@ -462,7 +471,10 @@ class Desk:
             raise RuntimeError("An unmanaged order is working")
         if self.working:
             self.reconcile_order(position, now)
-            return
+            # A child that has reached a terminal state and reconciled with the
+            # position is followed by the next one on this same snapshot.
+            if self.working or not self.inventory:
+                return
         if position != inventory.expected:
             if not inventory.confirmed and position == 0 and now - inventory.sent_at < 5:
                 return
@@ -471,8 +483,11 @@ class Desk:
         if self.halted or now < self.venue.next_submit:
             return
         book = snapshot["books"][tender.ticker]
-        child = next_unwind(tender, position, book, open_orders=0)
         remaining = snapshot["end_tick"] - snapshot["tick"]
+        chunks = (abs(position) + CAP[tender.ticker] - 1) // CAP[tender.ticker]
+        hurried = remaining <= self.strategy.exit_reserve_ticks + self.strategy.ticks_per_child * chunks
+        band = CENT * self.strategy.sweep_band if self.strategy.sweep_band and not hurried else None
+        child = next_unwind(tender, position, book, open_orders=0, band=band)
         if 0 < remaining <= self.strategy.market_closeout_ticks:
             qty, limit = min(abs(position), CAP[tender.ticker]), None
         elif child:

@@ -120,6 +120,7 @@
               <div class="presets">
                 <button type="button" data-preset="defensive"><strong>Defensive entry</strong><small>Stress depth and prices more</small></button>
                 <button type="button" data-preset="early"><strong>Earlier exits</strong><small>Allow more time to get flat</small></button>
+                <button type="button" data-preset="capture"><strong>Capture more</strong><small>Take more tenders, later in the heat</small></button>
               </div>
               <div id="draft" class="draft" hidden><strong>Proposed changes</strong><ul id="changes"></ul></div>
               <details class="advanced">
@@ -129,6 +130,7 @@
                   <label>Adverse move ($/share)<input name="adverse_move" type="number" min="0" max="1" step="any" required></label>
                   <label>Minimum edge ($/share)<input name="min_edge" type="number" min="0" max="1" step="any" required></label>
                   <label>Expiry buffer (ticks)<input name="decision_ticks" type="number" min="2" max="20" required></label>
+                  <label class="wide">Book refill between orders (%, 0 prices one sweep)<input name="refill" type="number" min="0" max="100" required></label>
                 </div></fieldset>
                 <fieldset><legend>Exit</legend><div class="fields">
                   <label>Minimum time left (ticks)<input name="min_heat_ticks" type="number" min="5" max="150" required></label>
@@ -136,6 +138,7 @@
                   <label>Exit reserve (ticks)<input name="exit_reserve_ticks" type="number" min="0" max="60" required></label>
                   <label>Limit price cushion (¢)<input name="limit_slippage_ticks" type="number" min="0" max="10" required></label>
                   <label class="wide">Market closeout window (ticks, 0 disables)<input name="market_closeout_ticks" type="number" min="0" max="30" required></label>
+                  <label class="wide">Sweep band per order (¢ through the touch, 0 takes the full order)<input name="sweep_band" type="number" min="0" max="50" required></label>
                 </div></fieldset>
                 <fieldset><legend>Fees</legend><div class="fields">
                   <label>Market fee ($/share)<input name="market_fee" type="number" min="0" max="1" step="any" required></label>
