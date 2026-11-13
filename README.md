@@ -60,17 +60,23 @@ py -3 rotman_lt3.py replay .rotman/snapshots.jsonl
 
 The automated tests use a local RIT HTTP mock. The backtest generates books, tender arrivals, latency and partial fills. Historical validation requires real practice snapshots and the transaction log. `--record` saves dashboard snapshots for comparison with that log.
 
-Results:
-| Run |  P&L   | Field average | Best       | Traders |
-|  1 | 37,970.76 | 26,332.62 | 80,373.92  | 6 |
-|  3 | 57,412.43 | 21,740.32 | 124,734.39 | 14 |
-|  4 | 24,769.50 | 8,530.67  |31,930.04   | 12 |
-|  5 | 43,771.12 | −7,879.06 | 106,902.75 | 11 |
-|  6 | 51,136.40 | 18,455.36 | 126,184.00 | 11 |
-|  7 | 15,229.51 | 15,296.21 | 104,198.53 | 12 |
-|  8 | 43,832.80 | 23,192.95 | 99,878.00  | 12 |
-|  9 | 34,848.59 | 17,911.79 | 117,015.22 | 12 |
- Settings used
+## Results
+
+| Run | P&L | Field average | Best | Traders |
+|---|---:|---:|---:|---:|
+| 1 | 37,970.76 | 26,332.62 | 80,373.92 | 6 |
+| 3 | 57,412.43 | 21,740.32 | 124,734.39 | 14 |
+| 4 | 24,769.50 | 8,530.67 | 31,930.04 | 12 |
+| 5 | 43,771.12 | -7,879.06 | 106,902.75 | 11 |
+| 6 | 51,136.40 | 18,455.36 | 126,184.00 | 11 |
+| 7 | 15,229.51 | 15,296.21 | 104,198.53 | 12 |
+| 8 | 43,832.80 | 23,192.95 | 99,878.00 | 12 |
+| 9 | 34,848.59 | 17,911.79 | 117,015.22 | 12 |
+
+## Settings used
+
+| Setting | Value |
+|---|---|
 | Depth removed (%) | 6 |
 | Adverse move ($/share) | 0.03 |
 | Minimum edge ($/share) | 0 |
