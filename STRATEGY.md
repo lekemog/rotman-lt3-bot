@@ -68,7 +68,7 @@ Almost all of that gain comes from one scenario, where the price jumps against e
 
 Last year's winning rounds averaged about $80,000 and the word from those rooms is that speed decides it. That agrees with the soak test below: every slow option lost when prices moved after acceptance.
 
-- **The desk now polls faster while something is live.** Every 0.2 seconds on Windows and 0.4 on a MacBook, against 0.55 before. Each child order waits on one poll, so a 70,000-share TAME unwind of seven orders is seconds shorter. `--busy-interval` sets it.
+- **The desk now polls faster while something is live.** Every 0.2 seconds on Windows, against 0.55 before. A MacBook keeps 0.55 unless you pass `--busy-interval`, because its server is rate-limited. Each child order waits on one poll, so a 70,000-share TAME unwind of seven orders is seconds shorter. `--busy-interval` sets it.
 - **A rate limit no longer disarms the desk.** RIT's rate-limit reply means it acted on nothing, so the desk waits as told, sends the request again, polls 0.1 seconds slower for the rest of the session and stays armed. Before, one such reply paused entries until someone re-armed.
 - **The MacBook path is the slow one.** It talks to Toronto over the internet and is rate-limited by the server. If either of you can run the Windows RIT Client, that laptop will be faster.
 - **Speed and Review pull against each other.** A click costs seconds. If Review has earned more for you, keep it, but approve the fat tenders the moment they appear and save the waiting for thin ones.
