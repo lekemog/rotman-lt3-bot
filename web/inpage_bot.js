@@ -134,6 +134,7 @@
       }
     }
     const res = await order(ticker, exitSide, qty, price);
+    if (res && res.success === false) { st.nextSubmit = Date.now() + 300; log("order refused, retrying:", res.error || ""); return; }
     st.working = { at: Date.now(), rest };
     log("ORDER", exitSide, qty, ticker, price == null ? "MKT" : "@" + r2(price), note, res && res.success === false ? "ERR " + (res.error || "") : "ok");
   }
@@ -170,6 +171,7 @@
               if (status === "ACCEPT") {
                 st.attempted.add(t.tenderId);
                 const r = await post("/Trading/AcceptTender?tenderId=" + encodeURIComponent(t.tenderId));
+                if (r && r.success === false && /429/.test(r.error || "")) { st.attempted.delete(t.tenderId); log("accept rate-limited, retrying #" + t.tenderId); await sleep(300); continue; }
                 log("ACCEPT #" + t.tenderId, t.action, t.quantity, t.ticker, "@" + t.price, "·", why, r && r.success === false ? "ERR " + (r.error || "") : "ok");
                 st.nextSubmit = Date.now() + 300;
               } else if (st.lastWhy !== t.tenderId + why) {
