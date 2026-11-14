@@ -230,6 +230,33 @@ def evaluate(tender, snapshot, settings):
     return replace(decision, status="ACCEPT", reason="Full stressed unwind clears fees and edge")
 
 
+def entry_bar(tender, snapshot, settings, patience, sigma):
+    """Extra model profit, in dollars, an automatic entry waits for.
+
+    A tender is a free option until it expires and the mid has no drift, so a
+    thin edge is worth more watched than taken. The bar is `patience` standard
+    deviations of the mid over the ticks still available, and it falls to zero
+    at the last tick on which the tender can be accepted. This is the timing a
+    trader applies by eye in Review.
+    """
+    tick = snapshot["tick"]
+    window = min(tender.expires - tick - settings.decision_ticks,
+                 snapshot["end_tick"] - tick - settings.min_heat_ticks) - 1
+    if not patience or not sigma or window <= 0:
+        return ZERO
+    return tender.quantity * decimal(patience) * decimal(sigma) * Decimal(window).sqrt()
+
+
+def tick_sigma(mids):
+    """Standard deviation of one-tick changes in a list of mids, or None if too short."""
+    moves = [float(after - before) for before, after in zip(mids, mids[1:])
+             if before is not None and after is not None]
+    if len(moves) < 12:
+        return None
+    mean = sum(moves) / len(moves)
+    return (sum((move - mean) ** 2 for move in moves) / len(moves)) ** 0.5
+
+
 def next_unwind(confirmed_tender, position, book, open_orders, band=None, quantity=None):
     """Suggest one marketable limit for confirmed inventory from a flat start.
 
@@ -517,6 +544,11 @@ def self_test():
     assert passive_unwind(strong, 50_000, dict(bids=book["bids"], asks=[])).limit == Decimal("9.99")
     assert passive_unwind(strong, -5_000, book) is None
     assert next_unwind(strong, 50_000, book, 0, quantity=3_000) == ChildOrder("CRZY", "SELL", 3_000, Decimal("9.98"))
+    # The entry bar scales with volatility and the time left, and ends at zero.
+    assert entry_bar(strong, snapshot, settings, 1, "0.02") == 50_000 * Decimal("0.02") * Decimal(22).sqrt()
+    assert entry_bar(strong, dict(snapshot, tick=122), settings, 1, "0.02") == 0
+    assert entry_bar(strong, snapshot, settings, 0, "0.02") == entry_bar(strong, snapshot, settings, 1, None) == 0
+    assert tick_sigma([Decimal(10)] * 5) is None and tick_sigma([Decimal(10), Decimal(11)] * 8 + [Decimal(10)]) == 1.0
     print("LT3 self-test passed.")
 
 

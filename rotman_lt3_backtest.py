@@ -20,8 +20,8 @@ from random import Random
 from statistics import mean
 
 from rotman_lt3 import (
-    CAP, CENT, NET_LIMIT, ZERO, Settings, Tender, evaluate, exit_levels,
-    next_unwind, sweep,
+    CAP, CENT, NET_LIMIT, ZERO, Settings, Tender, entry_bar, evaluate, exit_levels,
+    next_unwind, sweep, tick_sigma,
 )
 
 
@@ -51,6 +51,7 @@ class Policy:
     settings: Settings = Settings()
     fallback_ticks: int = 0
     ticks_per_child: int = 0
+    patience: float = 0  # Sigmas of extra edge an entry waits for, as in the desk's Auto patience.
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,8 @@ POLICIES = (
     Policy("Stricter entry", replace(Settings(), depth_haircut=25, adverse_move=2 * CENT)),
     Policy("Starter + proposed closeout", fallback_ticks=12),
     Policy("Starter + time budget", ticks_per_child=6),
+    Policy("Time budget + patience 1", ticks_per_child=6, patience=1),
+    Policy("Time budget + patience 2", ticks_per_child=6, patience=2),
 )
 
 
@@ -146,7 +149,7 @@ class Heat:
         }
 
 
-def select_tender(tick, tenders, get_book, policy):
+def select_tender(tick, tenders, get_book, policy, mids=None):
     choices = []
     for tender in tenders:
         settings = policy.settings
@@ -157,6 +160,10 @@ def select_tender(tick, tenders, get_book, policy):
         snapshot = dict(tick=tick, period=1, end_tick=END, positions=dict.fromkeys(TICKERS, 0),
                         open_orders=0, books={tender.ticker: get_book(tender.ticker, tick)})
         decision = evaluate(tender, snapshot, settings)
+        if decision.status == "ACCEPT" and policy.patience:
+            sigma = tick_sigma([price * CENT for price in mids[tender.ticker][:tick + 1]])
+            if decision.stressed_pnl <= entry_bar(tender, snapshot, settings, policy.patience, sigma):
+                continue
         if decision.status == "ACCEPT":
             choices.append((decision.stressed_pnl, -tender.expires, tender))
     return max(choices, key=lambda choice: choice[:2])[-1] if choices else None
@@ -220,7 +227,7 @@ def run_heat(heat, policy):
 
         eligible = [tender for start, tender in heat.tenders
                     if start <= tick < tender.expires and tender.id not in accepted_ids]
-        active = select_tender(tick, eligible, heat.book, policy)
+        active = select_tender(tick, eligible, heat.book, policy, heat.mid)
         if active:
             accept_at = tick + scenario.accept_delay
 

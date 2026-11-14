@@ -121,6 +121,7 @@
                 <button type="button" data-preset="defensive"><strong>Defensive entry</strong><small>Stress depth and prices more</small></button>
                 <button type="button" data-preset="early"><strong>Earlier exits</strong><small>Allow more time to get flat</small></button>
                 <button type="button" data-preset="capture"><strong>Capture more</strong><small>Take more tenders, later in the heat</small></button>
+                <button type="button" data-preset="timing"><strong>Review-style timing</strong><small>Auto waits for a better book</small></button>
                 <button type="button" data-preset="work"><strong>Work the exit</strong><small>Slice and rest orders over 15 ticks</small></button>
               </div>
               <div id="draft" class="draft" hidden><strong>Proposed changes</strong><ul id="changes"></ul></div>
@@ -131,6 +132,7 @@
                   <label>Adverse move ($/share)<input name="adverse_move" type="number" min="0" max="1" step="any" required></label>
                   <label>Minimum edge ($/share)<input name="min_edge" type="number" min="0" max="1" step="any" required></label>
                   <label>Expiry buffer (ticks)<input name="decision_ticks" type="number" min="2" max="20" required></label>
+                  <label class="wide">Auto patience (σ of the mid over the window left, 0 accepts at once)<input name="patience" type="number" min="0" max="5" step="any" required></label>
                   <label class="wide">Book refill between orders (%, 0 prices one sweep)<input name="refill" type="number" min="0" max="100" required></label>
                 </div></fieldset>
                 <fieldset><legend>Exit</legend><div class="fields">

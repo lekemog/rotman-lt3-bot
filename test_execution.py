@@ -341,6 +341,8 @@ class ExecutionTests(unittest.TestCase):
 
 
 class TuningTests(unittest.TestCase):
+    review_payload = ExecutionTests.review_payload
+
     def test_reconciled_child_is_followed_on_the_same_poll(self):
         mock = MockRIT()
         with rit_desk(mock) as desk:
@@ -415,13 +417,43 @@ class TuningTests(unittest.TestCase):
                     order = next(args for verb, path, args in mock.writes if path == "/v1/orders")
                     self.assertEqual((order["quantity"], order["price"]), (["25000"], ["9.94"]))
 
+    def test_auto_patience_waits_for_the_last_tick_and_review_is_not_held(self):
+        def volatile(desk):
+            desk.history.extend({"tick": tick, "CRZY": 9.99 + 0.02 * (tick % 2), "TAME": 9.99}
+                                for tick in range(70, 100))
+
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.strategy = replace(Strategy(), patience=Decimal(1))
+            volatile(desk)
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True, "entry_mode": "auto"})
+            desk.poll()
+            offer = desk.state()["tenders"][0]
+            self.assertEqual(offer["status"], "ACCEPT")
+            self.assertGreater(offer["auto_waits"], 0)
+            self.assertIn("Auto holds", offer["reason"])
+            self.assertEqual(mock.writes, [])
+            mock.case["tick"] = 120          # The last tick on which the tender can be taken.
+            desk.poll()
+            self.assertEqual([write[1] for write in mock.writes][:1], ["/v1/tenders/3"])
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.strategy = replace(Strategy(), patience=Decimal(1))
+            volatile(desk)
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True, "entry_mode": "review"})
+            desk.command("approve", self.review_payload(desk))
+            desk.poll()
+            self.assertEqual([write[1] for write in mock.writes][:1], ["/v1/tenders/3"])
+
     def test_profile_from_an_earlier_version_keeps_its_values(self):
         with TemporaryDirectory() as folder:
             directory = Path(folder)
             venue = DemoVenue()
             try:
                 earlier = dict(asdict(Strategy()), adverse_move="0.03", depth_haircut=6, ticks_per_child=6)
-                del earlier["refill"], earlier["sweep_band"], earlier["work_ticks"]
+                del earlier["refill"], earlier["sweep_band"], earlier["work_ticks"], earlier["patience"]
                 (directory / "strategy.json").write_text(json.dumps(earlier, default=str), encoding="utf-8")
                 strategy = Desk(venue, "rehearsal", directory).strategy
                 self.assertEqual((strategy.adverse_move, strategy.depth_haircut), (Decimal("0.03"), 6))

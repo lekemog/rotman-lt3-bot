@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 from rotman_lt3 import (
     CAP, CENT, ZERO, RateLimited, RITReader, Settings, Tender, decimal,
-    evaluate, exit_levels, next_unwind, parse_tender, passive_unwind, shares,
+    entry_bar, evaluate, exit_levels, next_unwind, parse_tender, passive_unwind, shares, tick_sigma,
 )
 from rotman_lt3_backtest import Heat, SCENARIOS, arrived_order
 
@@ -30,6 +30,7 @@ class Strategy(Settings):
     market_closeout_ticks: int = 0
     sweep_band: int = 0  # Cents through the touch one child may take. 0 sweeps the full chunk.
     work_ticks: int = 0  # Ticks over which to work a block out. 0 unwinds at once.
+    patience: Decimal = ZERO  # Auto waits for this many sigmas of extra edge. 0 accepts at once.
 
     def tender_settings(self, tender):
         chunks = (tender.quantity + CAP[tender.ticker] - 1) // CAP[tender.ticker]
@@ -43,7 +44,7 @@ STRATEGY_FIELDS = {
     "min_heat_ticks": (5, 150), "ticks_per_child": (1, 20),
     "exit_reserve_ticks": (0, 60), "limit_slippage_ticks": (0, 10),
     "market_closeout_ticks": (0, 30), "refill": (0, 100), "sweep_band": (0, 50),
-    "work_ticks": (0, 120),
+    "work_ticks": (0, 120), "patience": (0, 5),
 }
 
 
@@ -222,6 +223,7 @@ class Desk:
         self.record = record
         self.lock = RLock()
         self.book_depth = 50
+        self.peaks = {}
         self.strategy = Strategy()
         self.revision = 1
         self.events = deque(maxlen=60)
@@ -445,6 +447,16 @@ class Desk:
             row[ticker] = float((bids[0][0] + asks[0][0]) / 2) if bids and asks else None
         self.history.append(row)
 
+    def waits(self, tender, decision, snapshot):
+        """Dollars of extra model profit Auto still wants before taking this tender."""
+        rows = list(self.history)
+        mids = [after[tender.ticker] if after["tick"] - before["tick"] == 1 else None
+                for before, after in zip(rows, rows[1:])]
+        mids = [None if mid is None else Decimal(str(mid)) for mid in mids]
+        bar = entry_bar(tender, snapshot, self.strategy.tender_settings(tender),
+                        self.strategy.patience, tick_sigma(mids))
+        return max(ZERO, bar + self.strategy.min_edge * tender.quantity - decision.stressed_pnl)
+
     def decisions(self, snapshot):
         output = []
         for row in snapshot["tenders"]:
@@ -475,6 +487,8 @@ class Desk:
             candidates = [item for item in candidates if item[0] == approved and now <= deadline]
             if not candidates:
                 self.log("APPROVAL LAPSED", f"Tender #{approved.id} changed, expired or no longer clears the strategy")
+        else:
+            candidates = [item for item in candidates if not self.waits(*item, snapshot)]
         if not candidates:
             return
         tender, decision = max(candidates, key=lambda item: (item[1].stressed_pnl, -item[0].expires))
@@ -619,9 +633,19 @@ class Desk:
                         continue
                     if tender:
                         budget = self.strategy.tender_settings(tender).min_heat_ticks
+                        reason = decision.reason
+                        waiting = self.waits(tender, decision, snap) if decision.status == "ACCEPT" else ZERO
+                        if waiting:
+                            reason += f" · Auto holds for ${waiting:,.0f} more or the last tick"
+                        if decision.stressed_pnl is not None:
+                            # The best figure this tender has shown, to time a Review approval against.
+                            key = self.heat, tender.id
+                            self.peaks[key] = max(self.peaks.get(key, decision.stressed_pnl), decision.stressed_pnl)
+                            if self.peaks[key] > decision.stressed_pnl:
+                                reason += f" · best seen ${self.peaks[key]:,.0f}"
                         tenders.append(dict(id=tender.id, ticker=tender.ticker, side=tender.side,
                                             quantity=tender.quantity, price=tender.price, status=decision.status,
-                                            reason=decision.reason, visible=decision.visible_pnl,
+                                            reason=reason, auto_waits=waiting, visible=decision.visible_pnl,
                                             stressed=decision.stressed_pnl, depth=decision.stressed.filled, budget=budget,
                                             remaining=max(0, tender.expires - snap["tick"])))
                     else:

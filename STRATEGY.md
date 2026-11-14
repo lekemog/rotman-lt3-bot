@@ -33,11 +33,36 @@ Each change is small and sits on the code that produced the results above.
 | **Sweep band per order** (unwind) | 0, the old behaviour | A child takes only what is displayed within this many cents of the touch, then the next poll prices a fresh book. Full-size sweeps return automatically when the time budget runs short |
 | **Capture more** preset | Staged for you to apply | Refill 50, adverse move at most 2¢, 4 ticks per order, market closeout in the last 8 ticks |
 | **Work a block out over** (unwind) | 0, the old behaviour | Works the block along a straight line to flat over N ticks. On schedule it rests an order at the touch on its own side. Behind schedule it takes only the shortfall. Full speed returns when time is short or the next good tender is live |
+| **Auto patience** (entry timing) | 0, the old behaviour | Auto waits for an edge that is large against the mid's volatility over the time left, and takes any eligible tender on its last tick. Review is not held back |
 | **Work the exit** preset | Staged for you to apply | 15-tick worked exit, refill 75, adverse move at most 2¢, 8-tick market closeout |
 | `--book-depth` flag | 50 orders a side, as before | A deeper book request for when large tenders are refused as uncovered |
 | Saved profiles from the earlier version load with the new settings at 0 | | Your tuned `strategy.json` keeps working unchanged |
 
 Nothing changes in how the desk behaves until you apply a setting, apart from the faster chaining.
+
+## Review is earning more than Auto
+
+Take that at face value for the competition: **run Review**. It is the mode you have seen make more money on the live feed, and nothing here has been tested there.
+
+Review can only approve a tender that Auto would also take, so the difference has two possible sources. You approve later, when the book is better. Or you skip the thin ones. Both are the free-option idea: a tender costs nothing to watch for 30 ticks, the price has no drift, so a thin edge is worth more watched than taken, and a fat one should be taken at once.
+
+Be careful with the evidence. One heat's P&L moves by $10,000 or more on the price path alone, so a few heats of Review against a few of Auto cannot separate skill from luck. Three ways to test it:
+
+1. **On your own recordings.** `python3 review.py` now prints your entries against the same tenders taken at their first eligible tick. If your Review entries are clearly ahead, the edge is timing. This uses data you already have.
+2. **On tenders that ran their full window.** Record one practice heat in monitor mode. `review.py` replays Auto at once, with patience 1 and with patience 2 on every tender that stayed on screen.
+3. **In simulation.** `python3 rotman_lt3_backtest.py --heats 200` now carries two patience policies.
+
+The simulation result is mixed, and you should know that before turning patience on:
+
+| 1,400 synthetic heats per policy | Mean P&L | 5th percentile | Losing heats |
+| --- | ---: | ---: | ---: |
+| Accept at once | $22,320 | –$14,016 | 11.3% |
+| Patience 1 | $24,611 | $0 | 4.4% |
+| Patience 2 | $24,672 | $0 | 1.6% |
+
+Almost all of that gain comes from one scenario, where the price jumps against each tender a few ticks after it arrives. In a calm market patience 1 adds 2%. On a thin book it loses 3%. A replay on simulated monitor recordings, which values each entry as an instant sweep, put patience 1 about 15% behind accepting at once because it let four of eighteen tenders go. So patience protects against tenders that turn bad quickly and gives up some that were fine. It is a defence more than a profit engine.
+
+**Auto patience** is in the desk, off by default, for the case where you cannot click: the second laptop, or a heat where you are busy. The offer card now shows the best stressed figure each tender has reached, which is the number to time a Review approval against.
 
 ## The worked exit, and what it costs
 
@@ -60,7 +85,7 @@ The practice server is up until the heats. Change one thing per heat so each res
 
 If there is time for only one practice heat, run it with Capture more and Work the exit both applied, with `--record`, and read `review.py` afterwards. If there is no practice heat at all before 10:45, take Capture more into heat one and leave the work window at 0, because the entry change is plain arithmetic and the worked exit depends on how the real book behaves. Then use the morning heat's recording to decide on the worked exit for the afternoon.
 
-Run Auto in the competition unless you have a reason to overrule a tender. Review mode spends part of every 30-tick window on a click.
+Run whichever entry mode has earned more on the live feed. You report that Review has, so use Review.
 
 ## Settings I would start from
 

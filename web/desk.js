@@ -28,6 +28,7 @@ const fields = {
   refill: ["Book refill between orders", "%"],
   sweep_band: ["Sweep band per order", "¢"],
   work_ticks: ["Work a block out over", " ticks"],
+  patience: ["Auto patience", "σ"],
 };
 
 let state;
@@ -115,6 +116,8 @@ function stagePreset(preset) {
     ? { refill: Math.max(active.refill, 50), adverse_move: Math.min(active.adverse_move, 0.02),
         ticks_per_child: Math.min(active.ticks_per_child, 4),
         market_closeout_ticks: Math.max(active.market_closeout_ticks, 8) }
+    : preset === "timing"
+    ? { patience: Math.max(active.patience, 1) }
     : preset === "work"
     ? { work_ticks: active.work_ticks || 15, refill: Math.max(active.refill, 75),
         adverse_move: Math.min(active.adverse_move, 0.02),

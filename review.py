@@ -19,7 +19,7 @@ from pathlib import Path
 import re
 
 from execution import STRATEGY_FIELDS, Strategy, strategy_from_dict
-from rotman_lt3 import CENT, evaluate, exit_levels, parse_tender
+from rotman_lt3 import CENT, entry_bar, evaluate, exit_levels, parse_tender, tick_sigma
 
 
 ACCEPTED = re.compile(r"#(\d+) (BUY|SELL) ([\d,]+) (\w+) @ ([\d.]+)")
@@ -100,9 +100,17 @@ def main():
     taken_count = seen_count = 0
     exit_costs, realised_total, declined_value, capture_extra = [], Decimal(0), Decimal(0), 0
     reasons = Counter()
+    # Entered tenders leave the recording, so waiting can only be replayed on
+    # tenders that stayed on screen for their whole window.
+    timing = dict(actual=Decimal(0), first=Decimal(0), delays=[], watched=0, at_once=Decimal(0),
+                  patient={1: [Decimal(0), 0], 2: [Decimal(0), 0]})
     for number, heat in enumerate(heats, 1):
         print(f"\nHEAT {number}  (ticks {heat[0]['tick']}–{heat[-1]['tick']})")
         offers = {}
+        path = {}   # Last mid seen in each tick, per ticker, for the volatility estimate.
+        for snapshot in heat:
+            for ticker, book in snapshot["books"].items():
+                path.setdefault(ticker, {})[snapshot["tick"]] = mid(book)
         for index, snapshot in enumerate(heat):
             flat = dict(snapshot, positions=dict.fromkeys(snapshot["positions"], 0), open_orders=0)
             for raw in snapshot["tenders"]:
@@ -125,6 +133,27 @@ def main():
             taken = bool(after and after["positions"][tender.ticker] * tender.direction > 0
                          and last_tick < tender.expires - 1)
             sweeps = [row[3] for row in rows if row[3] is not None]
+            # Entry timing, valued as the one-sweep profit on the recorded book
+            # at the moment of entry. A tender not entered counts as zero.
+            eligible = [row for row in rows if row[4].status == "ACCEPT"]
+            if taken and eligible and rows[-1][4].visible_pnl is not None:
+                timing["actual"] += rows[-1][4].visible_pnl
+                timing["first"] += eligible[0][4].visible_pnl
+                timing["delays"].append(last_tick - eligible[0][1])
+            elif eligible and not taken and last_tick >= tender.expires - 2:
+                timing["watched"] += 1
+                timing["at_once"] += eligible[0][4].visible_pnl
+                for patience, total in timing["patient"].items():
+                    for row in eligible:
+                        ticks = sorted(tick for tick in path[tender.ticker] if tick <= row[1])
+                        mids = [path[tender.ticker][tick] if tick - before == 1 else None
+                                for before, tick in zip(ticks, ticks[1:])]
+                        probe = dict(tick=row[1], end_tick=heat[row[0]]["end_tick"])
+                        bar = entry_bar(tender, probe, active.tender_settings(tender), patience, tick_sigma(mids))
+                        if row[4].stressed_pnl > bar:
+                            total[0] += row[4].visible_pnl
+                            total[1] += 1
+                            break
             line = (f"  t{item['first']:03d} #{tender.id} {tender.ticker} {tender.side:<4} {tender.quantity:>7,}"
                     f" @ {tender.price:>6.2f} · premium {cents(rows[0][2])} · sweep first {cents(sweeps[0] if sweeps else None)}"
                     f" best {cents(max(sweeps) if sweeps else None)}")
@@ -173,6 +202,21 @@ def main():
         print(f"  not taken: {dict(reasons)}")
         print(f"  best one-sweep profit visible on tenders not taken: ${declined_value:,.0f}")
         print(f"  tenders the Capture more settings accept that the active settings never did: {capture_extra}")
+    print("\nENTRY TIMING  (one-sweep profit on the recorded book at the moment of entry, summed)")
+    if timing["delays"]:
+        delays = sorted(timing["delays"])
+        print(f"  your {len(delays)} entries: ${timing['actual']:,.0f}, entered a median of"
+              f" {delays[len(delays) // 2]} ticks after first becoming eligible")
+        print(f"  the same tenders at their first eligible tick: ${timing['first']:,.0f}")
+        print("  If the first line is clearly larger in your Review sessions, the extra profit in Review is timing.")
+    if timing["watched"]:
+        print(f"  {timing['watched']} eligible tenders stayed on screen for their whole window. Replaying Auto on them:")
+        print(f"    accept at once: ${timing['at_once']:,.0f} on {timing['watched']} tenders")
+        for patience, (total, count) in timing["patient"].items():
+            print(f"    patience {patience}: ${total:,.0f} on {count} tenders")
+    else:
+        print("  To test Auto patience, record a practice heat in monitor mode (no --enable-orders) or armed in"
+              " Review without approving. Tenders must stay on screen for their whole window to be replayed.")
     print("\nHOW TO READ IT")
     print("  A large exit cost means the unwind is the leak. Try a sweep band of 3 to 5 cents for a heat and"
           " compare this figure.")
