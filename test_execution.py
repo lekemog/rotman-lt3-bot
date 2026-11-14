@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
-from dashboard import handler_for
+from dashboard import handler_for, poll_loop
 from execution import DemoVenue, Desk, RITVenue, Strategy
 from rotman_lt3 import CAP, RateLimited, STALE_SNAPSHOT, demo_snapshot
 
@@ -48,6 +48,7 @@ class MockRIT:
         self.read_gate = None
         self.reads = []
         self.waits = {}
+        self.limit_writes = 0   # Number of POST or DELETE requests to refuse with HTTP 429.
 
     @property
     def ticker(self):
@@ -94,6 +95,10 @@ class MockRIT:
             def do_POST(self):
                 url = urlsplit(self.path)
                 mock.writes.append(("POST", url.path, parse_qs(url.query)))
+                if mock.limit_writes:
+                    mock.limit_writes -= 1
+                    self.answer({"wait": 0.1}, 429)
+                    return
                 if url.path.startswith("/v1/tenders/"):
                     tender = mock.tenders.pop()
                     mock.positions[mock.ticker] = abs(tender["quantity"]) * (1 if mock.side == "BUY" else -1)
@@ -115,6 +120,10 @@ class MockRIT:
 
             def do_DELETE(self):
                 mock.writes.append(("DELETE", self.path, {}))
+                if mock.limit_writes:
+                    mock.limit_writes -= 1
+                    self.answer({"wait": 0.1}, 429)
+                    return
                 mock.orders[int(self.path.split("/")[-1])]["status"] = "CANCELLED"
                 self.answer({"success": True})
 
@@ -465,6 +474,66 @@ class TuningTests(unittest.TestCase):
                     order = next(args for verb, path, args in mock.writes if path == "/v1/orders")
                     self.assertEqual((order["quantity"], order["price"]), ([quantity], [price]))
                     self.assertFalse(desk.fault)
+
+    def test_rate_limited_writes_are_sent_again_and_the_desk_stays_armed(self):
+        mock = MockRIT()
+        with rit_desk(mock) as desk:
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True})
+            self.assertTrue(desk.busy())          # A tender is on the clock.
+            steps = []
+            for _ in range(14):
+                # Refuse the accept, then the first order, then the cancel of its remainder.
+                due = (not desk.inventory, bool(desk.inventory) and not desk.working,
+                       bool(desk.working) and desk.working.cancelled_at is None)
+                if len(steps) < 3 and due[len(steps)] and not mock.limit_writes:
+                    mock.limit_writes = 1
+                try:
+                    desk.poll()
+                except RateLimited:
+                    desk.rate_limited()
+                    steps.append(mock.writes[-1][:2])
+                if desk.working:
+                    desk.working.sent_at -= 1
+            self.assertEqual([verb for verb, _ in steps], ["POST", "POST", "DELETE"])
+            self.assertEqual(steps[0][1], "/v1/tenders/3")
+            self.assertEqual([path for verb, path, _ in mock.writes].count("/v1/tenders/3"), 2)
+            self.assertTrue(desk.armed)
+            self.assertFalse(desk.fault)
+            self.assertEqual(desk.completed, 1)
+            self.assertFalse(any(mock.positions.values()))
+            self.assertFalse(desk.busy())
+            self.assertEqual(desk.rate_limits, 3)
+
+    def test_poll_loop_speeds_up_when_busy_and_backs_off_when_limited(self):
+        class Stop:
+            def __init__(self):
+                self.delays = []
+
+            def is_set(self):
+                return len(self.delays) >= 4
+
+            def wait(self, delay):
+                self.delays.append(round(delay, 2))
+
+        class FakeDesk:
+            polls = limited = 0
+
+            def poll(self):
+                self.polls += 1
+                if self.polls == 3:
+                    raise RateLimited(0.05)
+
+            def busy(self):
+                return self.polls != 1
+
+            def rate_limited(self):
+                self.limited += 1
+
+        stop, desk = Stop(), FakeDesk()
+        poll_loop(desk, stop, idle=0.55, busy=0.2)
+        self.assertEqual(stop.delays, [0.55, 0.2, 0.3, 0.3])
+        self.assertEqual(desk.limited, 1)
 
     def test_profile_from_an_earlier_version_keeps_its_values(self):
         with TemporaryDirectory() as folder:

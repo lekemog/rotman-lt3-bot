@@ -64,6 +64,20 @@ Almost all of that gain comes from one scenario, where the price jumps against e
 
 **Auto patience** is in the desk, off by default, for the case where you cannot click: the second laptop, or a heat where you are busy. The offer card now shows the best stressed figure each tender has reached, which is the number to time a Review approval against.
 
+## Speed
+
+Last year's winning rounds averaged about $80,000 and the word from those rooms is that speed decides it. That agrees with the soak test below: every slow option lost when prices moved after acceptance.
+
+- **The desk now polls faster while something is live.** Every 0.2 seconds on Windows and 0.4 on a MacBook, against 0.55 before. Each child order waits on one poll, so a 70,000-share TAME unwind of seven orders is seconds shorter. `--busy-interval` sets it.
+- **A rate limit no longer disarms the desk.** RIT's rate-limit reply means it acted on nothing, so the desk waits as told, sends the request again, polls 0.1 seconds slower for the rest of the session and stays armed. Before, one such reply paused entries until someone re-armed.
+- **The MacBook path is the slow one.** It talks to Toronto over the internet and is rate-limited by the server. If either of you can run the Windows RIT Client, that laptop will be faster.
+- **Speed and Review pull against each other.** A click costs seconds. If Review has earned more for you, keep it, but approve the fat tenders the moment they appear and save the waiting for thin ones.
+- **Leave the worked exit and Auto patience at 0.** They are the opposite of fast.
+
+A search of public code and forums found one LT3 project, an advisory script that prices a tender by walking the book for the full quantity, as this desk already does. There was no public write-up of a winning approach.
+
+Three habits carried over from the market-making bot you shared: check every assumption about rules and timing against the live feed before trusting it, read the position from the exchange and never from your own count, and size so that being wrong is survivable. The desk already does the second. The first is the practice heat. The third is the position you take off within seconds.
+
 ## Manual traders making silly trades
 
 The room will have people trading by hand, and some will fat-finger a market order or dump a block in one go. That reaches you in three ways.

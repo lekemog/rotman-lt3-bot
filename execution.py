@@ -79,6 +79,13 @@ class RITVenue(RITReader):
         self.connection.request(method, path, headers=self.headers)
         response = self.connection.getresponse()
         body = response.read()
+        if response.status == 429:
+            # RIT refused the request before acting on it, so sending it again is safe.
+            try:
+                wait = float(decimal(response.getheader("Retry-After") or json.loads(body)["wait"]))
+            except (ValueError, ArithmeticError, KeyError, TypeError):
+                wait = 1.0
+            raise RateLimited(max(0.05, wait))
         if response.status != 200:
             raise RuntimeError(f"RIT returned HTTP {response.status} for {method} {endpoint}")
         if endpoint == "orders":
@@ -225,6 +232,7 @@ class Desk:
         self.record = record
         self.lock = RLock()
         self.book_depth = 50
+        self.rate_limits = 0
         self.peaks = {}
         self.strategy = Strategy()
         self.revision = 1
@@ -380,6 +388,21 @@ class Desk:
                 self.log("FEED", "Entries paused after a feed error")
             self.status = message
 
+    def rate_limited(self):
+        """RIT asked for fewer requests. Nothing was acted on, so the desk stays armed."""
+        with self.lock:
+            self.approval = None
+            self.status = "RIT rate limit · waiting for a fresh snapshot"
+            self.rate_limits += 1
+            if self.rate_limits in (1, 5, 25):
+                self.log("RATE LIMIT", f"RIT has slowed the desk {self.rate_limits} time(s). Polling backs off."
+                                       " Raise --busy-interval if this keeps appearing.")
+
+    def busy(self):
+        """Is there something on the clock: a live tender, an approval or inventory?"""
+        with self.lock:
+            return bool(self.inventory or self.approval or (self.is_fresh() and self.snapshot["tenders"]))
+
     def poll(self):
         # Hold the lock across the snapshot and writes. Restart, halt and strategy
         # revisions apply between complete iterations and never race a submission.
@@ -495,7 +518,12 @@ class Desk:
             return
         tender, decision = max(candidates, key=lambda item: (item[1].stressed_pnl, -item[0].expires))
         self.attempted.add(tender.id)
-        if not self.venue.accept(tender):
+        try:
+            accepted = self.venue.accept(tender)
+        except RateLimited:
+            self.attempted.discard(tender.id)  # Refused before it was processed. Try again next poll.
+            raise
+        if not accepted:
             self.fail(f"Tender {tender.id} was not confirmed by RIT")
             return
         self.inventory = Inventory(tender, tender.direction * tender.quantity, time.monotonic(),
@@ -607,7 +635,11 @@ class Desk:
         if status == "OPEN":
             if working.cancelled_at is None and (self.halted or now - working.sent_at >= working.rest):
                 working.cancelled_at = time.monotonic()
-                self.venue.cancel(working.id)  # It may already have filled. Recheck the order.
+                try:
+                    self.venue.cancel(working.id)  # It may already have filled. Recheck the order.
+                except RateLimited:
+                    working.cancelled_at = None
+                    raise
                 self.log("CANCEL SENT", f"Working child #{working.id}")
             elif working.cancelled_at is not None and now - working.cancelled_at >= 5:
                 raise RuntimeError("Cancellation was not confirmed")

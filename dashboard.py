@@ -77,14 +77,20 @@ def handler_for(desk, port):
     return Handler
 
 
-def poll_loop(desk, stop):
+def poll_loop(desk, stop, idle=0.55, busy=0.55):
+    """Poll quickly while a tender or inventory is on the clock, and steadily otherwise.
+
+    A rate-limit reply means RIT acted on nothing. The desk stays armed, waits as
+    told, and polls a little slower for the rest of the session.
+    """
     while not stop.is_set():
         try:
             desk.poll()
-            delay = 0.55
+            delay = busy if desk.busy() else idle
         except RateLimited as error:
-            desk.feed_error("RIT rate limit · waiting for a fresh snapshot")
-            delay = error.wait
+            desk.rate_limited()
+            busy = min(idle, busy + 0.1)
+            delay = max(busy, min(error.wait, 2.0))
         stop.wait(delay)
 
 
@@ -100,6 +106,10 @@ def main():
     parser.add_argument("--state-dir", type=Path, default=Path(".rotman"))
     parser.add_argument("--record", action="store_true", help="Record RIT snapshots locally for replay")
     parser.add_argument("--no-open", action="store_true", help="Leave opening the browser to the operator")
+    parser.add_argument("--interval", type=float, default=0.55, help="Seconds between polls when nothing is live")
+    parser.add_argument("--busy-interval", type=float,
+                        help="Seconds between polls while a tender or inventory is live"
+                             " (default 0.2 on Windows, 0.4 on a MacBook, 0.55 in rehearsal)")
     parser.add_argument("--book-depth", type=int, default=50,
                         help="Orders requested per side of each book. Raise it if large tenders show as uncovered")
     args = parser.parse_args()
@@ -110,6 +120,10 @@ def main():
         parser.error("Use --dma-https with --mac")
     if not 1 <= args.port <= 65535 or (args.rit_port is not None and not 1 <= args.rit_port <= 65535):
         parser.error("Use port numbers between 1 and 65535")
+    if args.busy_interval is None:
+        args.busy_interval = 0.4 if args.mac else 0.2 if args.windows else args.interval
+    if not 0.05 <= args.busy_interval <= args.interval <= 5:
+        parser.error("Use 0.05 <= --busy-interval <= --interval <= 5 seconds")
     if not 20 <= args.book_depth <= 500:
         parser.error("Use a book depth between 20 and 500 orders")
     args.state_dir.mkdir(parents=True, exist_ok=True)
@@ -119,7 +133,7 @@ def main():
     desk.book_depth = args.book_depth
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(desk, args.port)) as server:
         stop = Event()
-        worker = Thread(target=poll_loop, args=(desk, stop), daemon=True)
+        worker = Thread(target=poll_loop, args=(desk, stop, args.interval, args.busy_interval), daemon=True)
         worker.start()
         url = f"http://127.0.0.1:{args.port}"
         print(f"Rotman LT3 desk · {url}", flush=True)
