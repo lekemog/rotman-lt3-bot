@@ -511,7 +511,7 @@ class TuningTests(unittest.TestCase):
                 self.delays = []
 
             def is_set(self):
-                return len(self.delays) >= 4
+                return len(self.delays) >= 5
 
             def wait(self, delay):
                 self.delays.append(round(delay, 2))
@@ -521,8 +521,8 @@ class TuningTests(unittest.TestCase):
 
             def poll(self):
                 self.polls += 1
-                if self.polls == 3:
-                    raise RateLimited(0.05)
+                if self.polls in (3, 4):
+                    raise RateLimited(0.05 if self.polls == 3 else 5)
 
             def busy(self):
                 return self.polls != 1
@@ -532,8 +532,8 @@ class TuningTests(unittest.TestCase):
 
         stop, desk = Stop(), FakeDesk()
         poll_loop(desk, stop, idle=0.55, busy=0.2)
-        self.assertEqual(stop.delays, [0.55, 0.2, 0.3, 0.3])
-        self.assertEqual(desk.limited, 1)
+        self.assertEqual(stop.delays, [0.55, 0.2, 0.3, 5, 0.4])   # The full wait RIT asks for is honoured.
+        self.assertEqual(desk.limited, 2)
 
     def test_profile_from_an_earlier_version_keeps_its_values(self):
         with TemporaryDirectory() as folder:

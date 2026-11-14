@@ -90,7 +90,7 @@ def poll_loop(desk, stop, idle=0.55, busy=0.55):
         except RateLimited as error:
             desk.rate_limited()
             busy = min(idle, busy + 0.1)
-            delay = max(busy, min(error.wait, 2.0))
+            delay = max(busy, error.wait)  # Wait the full time RIT asked for.
         stop.wait(delay)
 
 
@@ -109,7 +109,7 @@ def main():
     parser.add_argument("--interval", type=float, default=0.55, help="Seconds between polls when nothing is live")
     parser.add_argument("--busy-interval", type=float,
                         help="Seconds between polls while a tender or inventory is live"
-                             " (default 0.2 on Windows, 0.4 on a MacBook, 0.55 in rehearsal)")
+                             " (default 0.2 on Windows. A MacBook keeps the idle interval, as in practice)")
     parser.add_argument("--book-depth", type=int, default=50,
                         help="Orders requested per side of each book. Raise it if large tenders show as uncovered")
     args = parser.parse_args()
@@ -121,7 +121,7 @@ def main():
     if not 1 <= args.port <= 65535 or (args.rit_port is not None and not 1 <= args.rit_port <= 65535):
         parser.error("Use port numbers between 1 and 65535")
     if args.busy_interval is None:
-        args.busy_interval = 0.4 if args.mac else 0.2 if args.windows else args.interval
+        args.busy_interval = 0.2 if args.windows else args.interval
     if not 0.05 <= args.busy_interval <= args.interval <= 5:
         parser.error("Use 0.05 <= --busy-interval <= --interval <= 5 seconds")
     if not 20 <= args.book_depth <= 500:
