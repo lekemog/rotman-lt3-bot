@@ -42,6 +42,7 @@ class Scenario:
     shocks: bool = False
     overlap: bool = False
     drought: bool = False
+    erratic: bool = False  # Manual traders sweep one side of a book every so often.
     tender_fee: Decimal = ZERO
 
 
@@ -71,6 +72,7 @@ SCENARIOS = (
     Scenario("Overlapping tenders", overlap=True),
     Scenario("Late depth drought", drought=True, poll=2, order_delay=2, cancel_delay=2),
     Scenario("Fee on both legs", tender_fee=2 * CENT),
+    Scenario("Erratic manual traders", erratic=True),
 )
 POLICIES = (
     Policy("Visible only", replace(Settings(), depth_haircut=0, adverse_move=ZERO)),
@@ -128,6 +130,18 @@ class Heat:
         self.depth_scale = {}
         for ticker in TICKERS:
             self.depth_scale[ticker] = [rng.uniform(0.65, 1.35) for _ in range(END // 4 + 1)]
+        # A careless market order clears the top of one side. What is left sits
+        # 10 to 40 cents away at half size until the book refills a few ticks on.
+        # A separate generator keeps every other scenario's path unchanged.
+        self.holes = {ticker: [] for ticker in TICKERS}
+        if scenario.erratic:
+            noise = Random(seed * 7 + 1)
+            for ticker in TICKERS:
+                tick = noise.randint(5, 20)
+                while tick < END:
+                    self.holes[ticker].append((tick, tick + noise.randint(2, 5), noise.choice(("bids", "asks")),
+                                               noise.randint(10, 40)))
+                    tick += noise.randint(8, 22)
         self.book = cache(self._book)
 
     def _book(self, ticker, tick):
@@ -141,9 +155,11 @@ class Heat:
         depth_by_level = (21_000, 19_000, 17_000, 15_000, 13_000, 11_000, 9_000, 7_000)
         if ticker == "TAME":
             depth_by_level = (16_000, 14_000, 12_000, 11_000, 10_000, 8_000, 7_000, 6_000)
+        gaps = {side: gap for start, stop, side, gap in self.holes[ticker] if start <= tick < stop}
         return {
-            side: [dict(price=(mid + direction * (spread + level)) * CENT,
-                        quantity=int(depth * scale * rng.uniform(0.55, 1.45)), quantity_filled=0)
+            side: [dict(price=(mid + direction * (spread + level + gaps.get(side, 0))) * CENT,
+                        quantity=int(depth * scale * rng.uniform(0.55, 1.45) * (0.5 if side in gaps else 1)),
+                        quantity_filled=0)
                    for level, depth in enumerate(depth_by_level)]
             for side, direction in (("bids", -1), ("asks", 1))
         }

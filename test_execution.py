@@ -447,13 +447,33 @@ class TuningTests(unittest.TestCase):
             desk.poll()
             self.assertEqual([write[1] for write in mock.writes][:1], ["/v1/tenders/3"])
 
+    def test_hole_guard_rests_until_the_book_returns_or_time_is_short(self):
+        swept = [dict(price=price, quantity=20_000, quantity_filled=0) for price in ("9.60", "9.55")]
+        for tick, quantity, price in ((100, "25000", "9.99"), (285, "25000", "9.54")):
+            with self.subTest(tick=tick):
+                mock = MockRIT()
+                mock.tenders[0]["expires"] = 299
+                with rit_desk(mock) as desk:
+                    desk.strategy = replace(Strategy(), guard_bps=100)
+                    desk.history.extend({"tick": t, "CRZY": 9.99, "TAME": 9.99} for t in range(80, 100))
+                    desk.poll()
+                    desk.command("arm", {"api_orders_enabled": True})
+                    desk.poll()
+                    mock.books["CRZY"] = dict(mock.books["CRZY"], bids=swept)   # A careless seller clears the bids.
+                    mock.case["tick"] = tick
+                    desk.poll()
+                    order = next(args for verb, path, args in mock.writes if path == "/v1/orders")
+                    self.assertEqual((order["quantity"], order["price"]), ([quantity], [price]))
+                    self.assertFalse(desk.fault)
+
     def test_profile_from_an_earlier_version_keeps_its_values(self):
         with TemporaryDirectory() as folder:
             directory = Path(folder)
             venue = DemoVenue()
             try:
                 earlier = dict(asdict(Strategy()), adverse_move="0.03", depth_haircut=6, ticks_per_child=6)
-                del earlier["refill"], earlier["sweep_band"], earlier["work_ticks"], earlier["patience"]
+                for name in ("refill", "sweep_band", "work_ticks", "patience", "guard_bps"):
+                    del earlier[name]
                 (directory / "strategy.json").write_text(json.dumps(earlier, default=str), encoding="utf-8")
                 strategy = Desk(venue, "rehearsal", directory).strategy
                 self.assertEqual((strategy.adverse_move, strategy.depth_haircut), (Decimal("0.03"), 6))

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from http.client import HTTPException
 from random import Random
+from statistics import median
 import json
 from threading import RLock
 import time
@@ -31,6 +32,7 @@ class Strategy(Settings):
     sweep_band: int = 0  # Cents through the touch one child may take. 0 sweeps the full chunk.
     work_ticks: int = 0  # Ticks over which to work a block out. 0 unwinds at once.
     patience: Decimal = ZERO  # Auto waits for this many sigmas of extra edge. 0 accepts at once.
+    guard_bps: int = 0  # Do not hit a quote this far (1/100 %) through the recent mid. 0 is off.
 
     def tender_settings(self, tender):
         chunks = (tender.quantity + CAP[tender.ticker] - 1) // CAP[tender.ticker]
@@ -44,7 +46,7 @@ STRATEGY_FIELDS = {
     "min_heat_ticks": (5, 150), "ticks_per_child": (1, 20),
     "exit_reserve_ticks": (0, 60), "limit_slippage_ticks": (0, 10),
     "market_closeout_ticks": (0, 30), "refill": (0, 100), "sweep_band": (0, 50),
-    "work_ticks": (0, 120), "patience": (0, 5),
+    "work_ticks": (0, 120), "patience": (0, 5), "guard_bps": (0, 500),
 }
 
 
@@ -537,7 +539,11 @@ class Desk:
                 inventory.start_tick = snapshot["tick"]
             left = max(0, self.strategy.work_ticks - (snapshot["tick"] - inventory.start_tick))
             behind = abs(position) - tender.quantity * left // self.strategy.work_ticks
-        resting = passive_unwind(tender, position, book) if behind is not None and behind <= 0 else None
+        # Another trader's careless order can clear the side we need to hit.
+        # Selling into that hole gives the stock away, so rest on our own side
+        # until the book refills or the time budget runs short.
+        hole = not hurried and not closeout and self.dislocated(tender, book)
+        resting = passive_unwind(tender, position, book) if hole or (behind is not None and behind <= 0) else None
         child = None if resting else next_unwind(tender, position, book, open_orders=0, band=band,
                                                  quantity=behind if behind and behind > 0 else None)
         if closeout:
@@ -553,7 +559,18 @@ class Desk:
         order_id = self.venue.submit(tender.ticker, tender.exit_side, qty, limit)
         self.working = WorkingOrder(order_id, qty, time.monotonic(), rest=rest)
         price = "market" if limit is None else f"{'resting' if resting else 'limit'} {limit:.2f}"
-        self.log("ORDER", f"#{order_id} {tender.exit_side} {qty:,} {tender.ticker} · {price}")
+        note = " · the other side is dislocated" if hole and resting else ""
+        self.log("ORDER", f"#{order_id} {tender.exit_side} {qty:,} {tender.ticker} · {price}{note}")
+
+    def dislocated(self, tender, book):
+        """Is the best quote we would hit far through the median mid of the last ten ticks?"""
+        mids = [row[tender.ticker] for row in list(self.history)[-11:-1] if row.get(tender.ticker) is not None]
+        levels = exit_levels(book, tender.exit_side)
+        if not self.strategy.guard_bps or len(mids) < 5 or not levels:
+            return False
+        reference = Decimal(str(median(mids)))
+        gap = reference - levels[0][0] if tender.exit_side == "SELL" else levels[0][0] - reference
+        return gap * 10_000 > self.strategy.guard_bps * reference
 
     def tender_waiting(self, snapshot):
         """Is a tender live that the desk would take from a flat book?

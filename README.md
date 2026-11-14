@@ -51,12 +51,13 @@ The entry defaults include a 10% depth reduction, one-cent adverse move and four
 
 ### Settings added after the practice runs
 
-All four start at 0, which leaves the desk behaving as it did in the runs below. [STRATEGY.md](STRATEGY.md) explains when to turn them on.
+All five start at 0, which leaves the desk behaving as it did in the runs below. [STRATEGY.md](STRATEGY.md) explains when to turn them on.
 
 - **Book refill between orders.** The entry model prices the exit as separate maximum-size orders, with this percentage of consumed depth back before each one. At 0 it prices one sweep of the whole block.
 - **Sweep band per order.** A child order takes only the liquidity displayed within this many cents of the touch. The next poll prices a fresh book. Full-size orders return when the exit time budget runs short. At 0 every child takes the full order size.
 - **Work a block out over.** The desk works the block along a straight line to flat over this many ticks. On or ahead of the line it rests a maximum-size order at the touch on its own side, one cent inside the spread when there is room, for two seconds. Behind the line it takes only the shortfall from the other side. It returns to full-speed unwinding when the exit time budget runs short, when the next acceptable tender is live, and in the market closeout window. At 0 the block is unwound at once.
 - **Auto patience.** Auto takes an eligible tender only once its stressed profit exceeds this many standard deviations of the mid over the ticks still available, and takes any eligible tender on its last acceptable tick. Volatility is measured from the current heat. Review is never held back by it. The offer card shows what Auto is holding for and the best stressed figure the tender has shown. **Review-style timing** stages a patience of 1.
+- **Hole guard.** When the best quote the desk would hit is more than this many hundredths of a percent through the median mid of the last ten ticks, another trader has probably swept that side. The desk rests an order on its own side of the spread until the book refills, and goes back to hitting quotes when the exit time budget runs short. **Erratic traders** stages a guard of 100 (1%) and an 8-tick market closeout. The rehearsal scenario *Erratic manual traders* shows it working.
 - **Work the exit** stages a 15-tick worked exit, a refill of 75%, an adverse move of at most 2¢ and an 8-tick market closeout.
 - **Capture more** stages a refill of 50%, an adverse move of at most 2¢, 4 ticks per order and a market closeout in the last 8 ticks for you to review and apply.
 

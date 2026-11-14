@@ -122,6 +122,7 @@
                 <button type="button" data-preset="early"><strong>Earlier exits</strong><small>Allow more time to get flat</small></button>
                 <button type="button" data-preset="capture"><strong>Capture more</strong><small>Take more tenders, later in the heat</small></button>
                 <button type="button" data-preset="timing"><strong>Review-style timing</strong><small>Auto waits for a better book</small></button>
+                <button type="button" data-preset="guard"><strong>Erratic traders</strong><small>Do not sell into a swept book</small></button>
                 <button type="button" data-preset="work"><strong>Work the exit</strong><small>Slice and rest orders over 15 ticks</small></button>
               </div>
               <div id="draft" class="draft" hidden><strong>Proposed changes</strong><ul id="changes"></ul></div>
@@ -142,6 +143,7 @@
                   <label>Limit price cushion (¢)<input name="limit_slippage_ticks" type="number" min="0" max="10" required></label>
                   <label class="wide">Market closeout window (ticks, 0 disables)<input name="market_closeout_ticks" type="number" min="0" max="30" required></label>
                   <label class="wide">Work a block out over (ticks, 0 unwinds at once)<input name="work_ticks" type="number" min="0" max="120" required></label>
+                  <label class="wide">Hole guard (hundredths of 1% through the recent mid, 0 is off)<input name="guard_bps" type="number" min="0" max="500" required></label>
                   <label class="wide">Sweep band per order (¢ through the touch, 0 takes the full order)<input name="sweep_band" type="number" min="0" max="50" required></label>
                 </div></fieldset>
                 <fieldset><legend>Fees</legend><div class="fields">
@@ -164,6 +166,7 @@
             <label>Scenario <select name="scenario">
               <option>Normal</option><option>Thin book</option><option>Adverse jump and depth loss</option>
               <option>Overlapping tenders</option><option>Late depth drought</option>
+              <option>Erratic manual traders</option>
             </select></label>
             <button type="submit" id="restart">Restart heat</button>
           </form>

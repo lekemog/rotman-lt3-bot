@@ -64,6 +64,35 @@ Almost all of that gain comes from one scenario, where the price jumps against e
 
 **Auto patience** is in the desk, off by default, for the case where you cannot click: the second laptop, or a heat where you are busy. The offer card now shows the best stressed figure each tender has reached, which is the number to time a Review approval against.
 
+## Manual traders making silly trades
+
+The room will have people trading by hand, and some will fat-finger a market order or dump a block in one go. That reaches you in three ways.
+
+- **A swept book while you are unwinding.** Someone clears the bids just as the desk needs to sell. The stock is still worth what it was, and the book refills within a few ticks, but a full-size order sent into that hole sells 10 to 40 cents too cheap. The **hole guard** catches this: if the best quote the desk would hit is more than 1% through the median mid of the last ten ticks, it rests an order on its own side of the spread and waits. It gives up waiting when the exit time budget runs short. A real price move stops looking like a hole after about five ticks, because the median catches up.
+- **A swept book while a tender is live.** The entry model already prices the exit off the displayed book, so a tender looks bad while the hole is there and good again when it refills. Nothing to change. In Review, do not approve on the tick a book has just been hit. Wait for the "best seen" figure to come back.
+- **Their mistakes are your fills.** A careless buyer lifting offers will hit a resting sell order at a good price. The desk can only collect this while it holds tender inventory. Trading on their mistakes without inventory is the speculation the case penalises, so the desk never does it.
+
+Their losses also move you up directly. Ranks are relative, so every manual trader who gives money away is one more team behind you, provided the desk does not join them.
+
+## What the final soak test showed
+
+The desk was run through about 130 simulated heats with your recorded settings and three alternatives. No heat faulted. One, with everything switched on in a late liquidity drought, ended with stock on the book.
+
+| Mean P&L per heat | Your settings | Capture more | Capture more + guard | Everything on |
+| --- | ---: | ---: | ---: | ---: |
+| Normal | $33,164 | $33,086 | $33,086 | $32,406 |
+| Thin book | $10,293 | $29,135 | $29,103 | $30,586 |
+| Price jumps against each tender | $18,188 | $23,288 | $23,964 | $6,895 |
+| Overlapping tenders | $33,862 | $33,845 | $33,845 | $33,934 |
+| Late depth drought | $27,393 | $27,711 | $27,711 | $28,232 |
+| Erratic manual traders | $31,192 | $32,417 | $33,435 | $33,282 |
+
+"Everything on" adds the 15-tick worked exit, Auto patience 1 and a 5¢ sweep band. The synthetic market is an assumption, so read the pattern and ignore the dollars.
+
+- **Capture more with the guard is never materially worse than your settings and is far better on a thin book.** It is the profile to take into the competition.
+- **The guard costs nothing when the book is orderly** and adds about $1,000 a heat, with a better worst case, when traders are erratic.
+- **The worked exit and patience are a bet on the market being kind after you accept.** When the price moved against each tender they lost two thirds of the P&L. Leave both at 0 unless a live practice heat says otherwise.
+
 ## The worked exit, and what it costs
 
 This is the largest lever available and the least proven. Do the sums before trusting it.
@@ -83,7 +112,7 @@ The practice server is up until the heats. Change one thing per heat so each res
 4. **If the exit cost is several cents**, apply **Work the exit** and run a heat. Keep it if the exit cost falls by more than a cent or two and every block finishes flat. If resting orders are almost never hit, set the work window back to 0 and try a sweep band of 3 instead.
 5. **Stop changing things after the last practice heat that went well.** Take that profile into the competition on both laptops.
 
-If there is time for only one practice heat, run it with Capture more and Work the exit both applied, with `--record`, and read `review.py` afterwards. If there is no practice heat at all before 10:45, take Capture more into heat one and leave the work window at 0, because the entry change is plain arithmetic and the worked exit depends on how the real book behaves. Then use the morning heat's recording to decide on the worked exit for the afternoon.
+If there is time for only one practice heat, run it with **Capture more** and **Erratic traders** applied, with `--record`, and read `review.py` afterwards. Take that profile into heat one. Leave the work window and Auto patience at 0. Use the morning heat's recording to decide whether anything changes for the afternoon.
 
 Run whichever entry mode has earned more on the live feed. You report that Review has, so use Review.
 
@@ -100,7 +129,9 @@ Run whichever entry mode has earned more on the live feed. You report that Revie
 | Budget per order | 6 | 4 | Faster chaining roughly halves the time each order needs |
 | Exit reserve | 8 | 8 | |
 | Market closeout | 0 | 8 | Open stock at the close is penalised. This is insurance and costs nothing when the desk is already flat |
-| Work a block out over | 0 | 15 after a comparison heat | The largest lever and the least proven |
+| Hole guard | 0 | 100 | Free in an orderly book, protective in an erratic one |
+| Auto patience | 0 | 0 | Mixed evidence. Review does this by eye |
+| Work a block out over | 0 | 0, or 15 only after a live comparison heat | Large upside, and it lost badly in simulation when prices moved against each tender |
 | Sweep band | 0 | 0 | The fallback if resting orders are not hit |
 
 ## How to think about one tender
