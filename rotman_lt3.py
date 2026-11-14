@@ -34,6 +34,7 @@ NET_LIMIT = 100_000
 GROSS_LIMIT = 250_000
 ZERO = Decimal(0)
 CENT = Decimal("0.01")
+DMA_HOST, DMA_PORT = "flserver.rotman.utoronto.ca", 16540  # Published practice server.
 MAX_SNAPSHOT_AGE = 1.5
 STALE_SNAPSHOT = "SNAPSHOT TOO OLD OR HEAT CHANGED"
 
@@ -312,7 +313,7 @@ class RateLimited(Exception):
 
 
 class RITReader:
-    def __init__(self, mode, port=None, *, dma_https=False):
+    def __init__(self, mode, port=None, *, dma_https=False, host=None):
         self.connection_mode = mode
         self.read_pool = None
         self.read_connections = []
@@ -322,7 +323,9 @@ class RITReader:
             self.headers = {"X-API-Key": getpass("RIT Client API key: ")}
         else:
             connect = HTTPSConnection if dma_https else HTTPConnection
-            self.connect_dma = partial(connect, "flserver.rotman.utoronto.ca", port or 16540, timeout=2)
+            self.server = host or DMA_HOST, port or DMA_PORT
+            print(f"RIT DMA server · {self.server[0]}:{self.server[1]}", flush=True)
+            self.connect_dma = partial(connect, *self.server, timeout=2)
             self.connection = self.connect_dma()
             credentials = f"{input('RIT Trader ID: ')}:{getpass('RIT password: ')}"
             self.headers = {"Authorization": "Basic " + base64.b64encode(credentials.encode()).decode()}
@@ -587,7 +590,7 @@ def watch(args, settings):
 
 
 def probe(args):
-    client = RITReader(args.mode, args.rit_port, dma_https=args.dma_https)
+    client = RITReader(args.mode, args.rit_port, dma_https=args.dma_https, host=args.rit_host)
     fresh, inactive = 0, 0
     try:
         for index in range(1, args.samples + 1):
@@ -643,6 +646,7 @@ def main():
     probe_parser.add_argument("mode", choices=("client", "dma"))
     probe_parser.add_argument("--samples", type=int, default=8)
     probe_parser.add_argument("--rit-port", type=int)
+    probe_parser.add_argument("--rit-host", help="DMA server host name given by the organisers")
     probe_parser.add_argument("--dma-https", action="store_true")
     replay_parser = commands.add_parser("replay")
     replay_parser.add_argument("input", type=Path)
