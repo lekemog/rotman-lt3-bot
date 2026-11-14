@@ -20,8 +20,8 @@ from random import Random
 from statistics import mean
 
 from rotman_lt3 import (
-    CAP, CENT, NET_LIMIT, ZERO, Settings, Tender, evaluate, exit_levels,
-    next_unwind, sweep,
+    CAP, CENT, NET_LIMIT, ZERO, Settings, Tender, entry_bar, evaluate, exit_levels,
+    next_unwind, sweep, tick_sigma,
 )
 
 
@@ -42,6 +42,7 @@ class Scenario:
     shocks: bool = False
     overlap: bool = False
     drought: bool = False
+    erratic: bool = False  # Manual traders sweep one side of a book every so often.
     tender_fee: Decimal = ZERO
 
 
@@ -51,6 +52,7 @@ class Policy:
     settings: Settings = Settings()
     fallback_ticks: int = 0
     ticks_per_child: int = 0
+    patience: float = 0  # Sigmas of extra edge an entry waits for, as in the desk's Auto patience.
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,7 @@ SCENARIOS = (
     Scenario("Overlapping tenders", overlap=True),
     Scenario("Late depth drought", drought=True, poll=2, order_delay=2, cancel_delay=2),
     Scenario("Fee on both legs", tender_fee=2 * CENT),
+    Scenario("Erratic manual traders", erratic=True),
 )
 POLICIES = (
     Policy("Visible only", replace(Settings(), depth_haircut=0, adverse_move=ZERO)),
@@ -77,6 +80,8 @@ POLICIES = (
     Policy("Stricter entry", replace(Settings(), depth_haircut=25, adverse_move=2 * CENT)),
     Policy("Starter + proposed closeout", fallback_ticks=12),
     Policy("Starter + time budget", ticks_per_child=6),
+    Policy("Time budget + patience 1", ticks_per_child=6, patience=1),
+    Policy("Time budget + patience 2", ticks_per_child=6, patience=2),
 )
 
 
@@ -125,6 +130,18 @@ class Heat:
         self.depth_scale = {}
         for ticker in TICKERS:
             self.depth_scale[ticker] = [rng.uniform(0.65, 1.35) for _ in range(END // 4 + 1)]
+        # A careless market order clears the top of one side. What is left sits
+        # 10 to 40 cents away at half size until the book refills a few ticks on.
+        # A separate generator keeps every other scenario's path unchanged.
+        self.holes = {ticker: [] for ticker in TICKERS}
+        if scenario.erratic:
+            noise = Random(seed * 7 + 1)
+            for ticker in TICKERS:
+                tick = noise.randint(5, 20)
+                while tick < END:
+                    self.holes[ticker].append((tick, tick + noise.randint(2, 5), noise.choice(("bids", "asks")),
+                                               noise.randint(10, 40)))
+                    tick += noise.randint(8, 22)
         self.book = cache(self._book)
 
     def _book(self, ticker, tick):
@@ -138,15 +155,17 @@ class Heat:
         depth_by_level = (21_000, 19_000, 17_000, 15_000, 13_000, 11_000, 9_000, 7_000)
         if ticker == "TAME":
             depth_by_level = (16_000, 14_000, 12_000, 11_000, 10_000, 8_000, 7_000, 6_000)
+        gaps = {side: gap for start, stop, side, gap in self.holes[ticker] if start <= tick < stop}
         return {
-            side: [dict(price=(mid + direction * (spread + level)) * CENT,
-                        quantity=int(depth * scale * rng.uniform(0.55, 1.45)), quantity_filled=0)
+            side: [dict(price=(mid + direction * (spread + level + gaps.get(side, 0))) * CENT,
+                        quantity=int(depth * scale * rng.uniform(0.55, 1.45) * (0.5 if side in gaps else 1)),
+                        quantity_filled=0)
                    for level, depth in enumerate(depth_by_level)]
             for side, direction in (("bids", -1), ("asks", 1))
         }
 
 
-def select_tender(tick, tenders, get_book, policy):
+def select_tender(tick, tenders, get_book, policy, mids=None):
     choices = []
     for tender in tenders:
         settings = policy.settings
@@ -157,6 +176,10 @@ def select_tender(tick, tenders, get_book, policy):
         snapshot = dict(tick=tick, period=1, end_tick=END, positions=dict.fromkeys(TICKERS, 0),
                         open_orders=0, books={tender.ticker: get_book(tender.ticker, tick)})
         decision = evaluate(tender, snapshot, settings)
+        if decision.status == "ACCEPT" and policy.patience:
+            sigma = tick_sigma([price * CENT for price in mids[tender.ticker][:tick + 1]])
+            if decision.stressed_pnl <= entry_bar(tender, snapshot, settings, policy.patience, sigma):
+                continue
         if decision.status == "ACCEPT":
             choices.append((decision.stressed_pnl, -tender.expires, tender))
     return max(choices, key=lambda choice: choice[:2])[-1] if choices else None
@@ -220,7 +243,7 @@ def run_heat(heat, policy):
 
         eligible = [tender for start, tender in heat.tenders
                     if start <= tick < tender.expires and tender.id not in accepted_ids]
-        active = select_tender(tick, eligible, heat.book, policy)
+        active = select_tender(tick, eligible, heat.book, policy, heat.mid)
         if active:
             accept_at = tick + scenario.accept_delay
 

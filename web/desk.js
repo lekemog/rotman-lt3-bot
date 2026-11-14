@@ -25,6 +25,11 @@ const fields = {
   exit_reserve_ticks: ["Exit reserve", " ticks"],
   limit_slippage_ticks: ["Limit price cushion", "¢"],
   market_closeout_ticks: ["Market closeout window", " ticks"],
+  refill: ["Book refill between orders", "%"],
+  sweep_band: ["Sweep band per order", "¢"],
+  work_ticks: ["Work a block out over", " ticks"],
+  patience: ["Auto patience", "σ"],
+  guard_bps: ["Hole guard", " bp"],
 };
 
 let state;
@@ -108,6 +113,18 @@ function stagePreset(preset) {
   const active = state.strategy;
   const changes = preset === "defensive"
     ? { depth_haircut: Math.max(active.depth_haircut, 25), adverse_move: Math.max(active.adverse_move, 0.02) }
+    : preset === "capture"
+    ? { refill: Math.max(active.refill, 50), adverse_move: Math.min(active.adverse_move, 0.02),
+        ticks_per_child: Math.min(active.ticks_per_child, 4),
+        market_closeout_ticks: Math.max(active.market_closeout_ticks, 8) }
+    : preset === "timing"
+    ? { patience: Math.max(active.patience, 1) }
+    : preset === "guard"
+    ? { guard_bps: active.guard_bps || 100, market_closeout_ticks: Math.max(active.market_closeout_ticks, 8) }
+    : preset === "work"
+    ? { work_ticks: active.work_ticks || 15, refill: Math.max(active.refill, 75),
+        adverse_move: Math.min(active.adverse_move, 0.02),
+        market_closeout_ticks: Math.max(active.market_closeout_ticks, 8) }
     : { min_heat_ticks: Math.max(active.min_heat_ticks, 35), ticks_per_child: Math.max(active.ticks_per_child, 8),
         exit_reserve_ticks: Math.max(active.exit_reserve_ticks, 15) };
   for (const [key, value] of Object.entries(changes)) form.elements.namedItem(key).value = value;

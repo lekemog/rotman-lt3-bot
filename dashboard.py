@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--state-dir", type=Path, default=Path(".rotman"))
     parser.add_argument("--record", action="store_true", help="Record RIT snapshots locally for replay")
     parser.add_argument("--no-open", action="store_true", help="Leave opening the browser to the operator")
+    parser.add_argument("--book-depth", type=int, default=50,
+                        help="Orders requested per side of each book. Raise it if large tenders show as uncovered")
     args = parser.parse_args()
     live = args.windows or args.mac
     if args.enable_orders and not live:
@@ -108,10 +110,13 @@ def main():
         parser.error("Use --dma-https with --mac")
     if not 1 <= args.port <= 65535 or (args.rit_port is not None and not 1 <= args.rit_port <= 65535):
         parser.error("Use port numbers between 1 and 65535")
+    if not 20 <= args.book_depth <= 500:
+        parser.error("Use a book depth between 20 and 500 orders")
     args.state_dir.mkdir(parents=True, exist_ok=True)
     venue = RITVenue(args.rit_port, args.enable_orders, mode="dma" if args.mac else "client",
                      dma_https=args.dma_https) if live else DemoVenue()
     desk = Desk(venue, "rit" if live else "rehearsal", args.state_dir, args.record)
+    desk.book_depth = args.book_depth
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(desk, args.port)) as server:
         stop = Event()
         worker = Thread(target=poll_loop, args=(desk, stop), daemon=True)

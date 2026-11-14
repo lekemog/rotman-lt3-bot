@@ -25,7 +25,7 @@ Use `--rit-port PORT` for a custom Windows local API port or the Mac DMA port as
 
 During practice, compare tender direction, size, expiry and fees with the RIT dialog and transaction log. Verify both connections on the practice session. Once the organisers permit API order submission, append `--enable-orders`, confirm permission in the dashboard, and arm the selected entry mode from a flat account. Use one desk instance per trader. Re-arm after a heat change or feed outage.
 
-Use `--state-dir` for a separate rehearsal or practice profile. Use `--no-open` to open the local URL yourself. The original `--rit` flag remains a Windows alias.
+Use `--book-depth N` to request more than 50 orders per side if `review.py` shows large tenders refused because displayed depth could not cover the block. Use `--state-dir` for a separate rehearsal or practice profile. Use `--no-open` to open the local URL yourself. The original `--rit` flag remains a Windows alias.
 
 ### Measure the Mac connection before a heat
 
@@ -48,6 +48,28 @@ Compare the fresh-snapshot counts and timings on Wi-Fi and a phone hotspot if th
 - **Review in RIT.** After an ambiguous order response or an inventory mismatch, inspect the RIT position and blotter. Reset is available once the account is flat and working orders have cleared. The desk does not retry an ambiguous submission.
 
 The entry defaults include a 10% depth reduction, one-cent adverse move and four-tick tender expiry buffer. The initial unwind budget is six ticks per minimum child plus a ten-tick reserve. These settings were chosen for rehearsal and need calibration on recorded RIT fills. In particular, the synthetic tests showed significant residual inventory during a late liquidity drought even with the longer entry budget.
+
+### Settings added after the practice runs
+
+All five start at 0, which leaves the desk behaving as it did in the runs below. [STRATEGY.md](STRATEGY.md) explains when to turn them on.
+
+- **Book refill between orders.** The entry model prices the exit as separate maximum-size orders, with this percentage of consumed depth back before each one. At 0 it prices one sweep of the whole block.
+- **Sweep band per order.** A child order takes only the liquidity displayed within this many cents of the touch. The next poll prices a fresh book. Full-size orders return when the exit time budget runs short. At 0 every child takes the full order size.
+- **Work a block out over.** The desk works the block along a straight line to flat over this many ticks. On or ahead of the line it rests a maximum-size order at the touch on its own side, one cent inside the spread when there is room, for two seconds. Behind the line it takes only the shortfall from the other side. It returns to full-speed unwinding when the exit time budget runs short, when the next acceptable tender is live, and in the market closeout window. At 0 the block is unwound at once.
+- **Auto patience.** Auto takes an eligible tender only once its stressed profit exceeds this many standard deviations of the mid over the ticks still available, and takes any eligible tender on its last acceptable tick. Volatility is measured from the current heat. Review is never held back by it. The offer card shows what Auto is holding for and the best stressed figure the tender has shown. **Review-style timing** stages a patience of 1.
+- **Hole guard.** When the best quote the desk would hit is more than this many hundredths of a percent through the median mid of the last ten ticks, another trader has probably swept that side. The desk rests an order on its own side of the spread until the book refills, and goes back to hitting quotes when the exit time budget runs short. **Erratic traders** stages a guard of 100 (1%) and an 8-tick market closeout. The rehearsal scenario *Erratic manual traders* shows it working.
+- **Work the exit** stages a 15-tick worked exit, a refill of 75%, an adverse move of at most 2¢ and an 8-tick market closeout.
+- **Capture more** stages a refill of 50%, an adverse move of at most 2¢, 4 ticks per order and a market closeout in the last 8 ticks for you to review and apply.
+
+A child order that has filled and reconciled with the position is now followed by the next one on the same poll.
+
+## Review a recorded session
+
+```sh
+python3 review.py
+```
+
+Reads `.rotman/snapshots.jsonl`, `activity.jsonl` and `strategy.json` from a session run with `--record`. For each tender it prints the premium against the mid, the profit from one immediate sweep, whether the desk took it and why not, and for completed tenders the exit cost against the mid. It then lists the declined tenders that the Capture more settings would accept, and compares your entries with entering the same tenders at their first eligible tick. Tenders that stayed on screen for their whole window are replayed under Auto patience 1 and 2. A heat recorded in monitor mode gives the most tenders for that replay. Use `--state-dir` for another folder.
 
 ## Verify or replay
 

@@ -64,6 +64,7 @@ class Settings:
     min_edge: Decimal = ZERO
     min_heat_ticks: int = 20
     decision_ticks: int = 2
+    refill: int = 0  # % of consumed depth assumed back before the next child order.
 
 
 @dataclass(frozen=True)
@@ -159,27 +160,46 @@ def exit_levels(book, exit_side):
     return sorted(prices.items(), reverse=selling)
 
 
-def sweep(levels, quantity, exit_side, haircut=0, adverse_move=ZERO):
-    """Walk exactly the required shares, including a partial last price level."""
-    filled, value, worst = 0, ZERO, None
-    for price, available in levels:
-        if filled == quantity:
-            break
-        available = available * (100 - haircut) // 100
-        take = min(quantity - filled, available)
-        stressed_price = price - adverse_move if exit_side == "SELL" else price + adverse_move
-        if take > 0 and stressed_price > 0:
-            filled += take
+def sweep(levels, quantity, exit_side, haircut=0, adverse_move=ZERO, cap=None, refill=0):
+    """Walk the required shares child by child, including a partial last level.
+
+    Each child takes at most `cap` shares. Liquidity taken by earlier children
+    leaves a hole at the top of the book and `refill` percent of that hole is
+    back before the next child. With refill 0 this is one sweep of the book.
+    """
+    cap = cap or quantity
+    levels = [(price, size * (100 - haircut) // 100) for price, size in levels]
+    filled, value, worst, hole = 0, ZERO, None, 0
+    while filled < quantity:
+        child = min(cap, quantity - filled)
+        hole = hole * (100 - refill) // 100
+        skip, got = hole, 0
+        for price, available in levels:
+            if skip >= available:
+                skip -= available
+                continue
+            take = min(child - got, available - skip)
+            skip = 0
+            stressed_price = price - adverse_move if exit_side == "SELL" else price + adverse_move
+            if stressed_price <= 0:
+                break
+            got += take
             value += take * stressed_price
             worst = stressed_price
+            if got == child:
+                break
+        filled += got
+        hole += got
+        if got < child:
+            break
     return Sweep(filled, value, worst)
 
 
 def evaluate(tender, snapshot, settings):
     levels = exit_levels(snapshot["books"][tender.ticker], tender.exit_side)
     visible = sweep(levels, tender.quantity, tender.exit_side)
-    stressed = sweep(levels, tender.quantity, tender.exit_side,
-                     settings.depth_haircut, settings.adverse_move)
+    stressed = sweep(levels, tender.quantity, tender.exit_side, settings.depth_haircut,
+                     settings.adverse_move, CAP[tender.ticker], settings.refill)
     entry_value = tender.price * tender.quantity
     fees = tender.quantity * (settings.market_fee + settings.tender_fee)
     visible_pnl = (tender.direction * (visible.value - entry_value) - fees
@@ -210,7 +230,34 @@ def evaluate(tender, snapshot, settings):
     return replace(decision, status="ACCEPT", reason="Full stressed unwind clears fees and edge")
 
 
-def next_unwind(confirmed_tender, position, book, open_orders):
+def entry_bar(tender, snapshot, settings, patience, sigma):
+    """Extra model profit, in dollars, an automatic entry waits for.
+
+    A tender is a free option until it expires and the mid has no drift, so a
+    thin edge is worth more watched than taken. The bar is `patience` standard
+    deviations of the mid over the ticks still available, and it falls to zero
+    at the last tick on which the tender can be accepted. This is the timing a
+    trader applies by eye in Review.
+    """
+    tick = snapshot["tick"]
+    window = min(tender.expires - tick - settings.decision_ticks,
+                 snapshot["end_tick"] - tick - settings.min_heat_ticks) - 1
+    if not patience or not sigma or window <= 0:
+        return ZERO
+    return tender.quantity * decimal(patience) * decimal(sigma) * Decimal(window).sqrt()
+
+
+def tick_sigma(mids):
+    """Standard deviation of one-tick changes in a list of mids, or None if too short."""
+    moves = [float(after - before) for before, after in zip(mids, mids[1:])
+             if before is not None and after is not None]
+    if len(moves) < 12:
+        return None
+    mean = sum(moves) / len(moves)
+    return (sum((move - mean) ** 2 for move in moves) / len(moves)) ** 0.5
+
+
+def next_unwind(confirmed_tender, position, book, open_orders, band=None, quantity=None):
     """Suggest one marketable limit for confirmed inventory from a flat start.
 
     Recheck fills and position before asking for another slice. A partially
@@ -223,10 +270,40 @@ def next_unwind(confirmed_tender, position, book, open_orders):
         raise ValueError("Position exceeds confirmed tender inventory")
     ticker = confirmed_tender.ticker
     side = confirmed_tender.exit_side
-    quote = sweep(exit_levels(book, side), min(abs(position), CAP[ticker]), side)
+    levels = exit_levels(book, side)
+    if band is not None and levels:
+        # A patient child takes only what is displayed within `band` of the
+        # touch. The rest of the chunk waits for the book to refill.
+        best = levels[0][0]
+        levels = [(price, size) for price, size in levels if abs(price - best) <= band]
+    quote = sweep(levels, min(abs(position), CAP[ticker], quantity or CAP[ticker]), side)
     if quote.filled == 0:
         return None
     return ChildOrder(ticker, side, quote.filled, quote.worst_price)
+
+
+def passive_unwind(confirmed_tender, position, book):
+    """Describe one resting order at the touch on our own side of the book.
+
+    Selling, it joins the best ask, or steps one cent inside it when the spread
+    allows, so incoming buyers reach it first. It never crosses the spread.
+    """
+    if position * confirmed_tender.direction <= 0:
+        return None
+    side = confirmed_tender.exit_side
+    ours = exit_levels(book, "BUY" if side == "SELL" else "SELL")   # Quotes we would join.
+    theirs = exit_levels(book, side)                                 # Quotes we would hit.
+    step = -CENT if side == "SELL" else CENT
+    if ours and theirs:
+        price = ours[0][0] + step if abs(ours[0][0] - theirs[0][0]) >= 2 * CENT else ours[0][0]
+    elif ours:
+        price = ours[0][0]
+    elif theirs:
+        price = theirs[0][0] - step
+    else:
+        return None
+    ticker = confirmed_tender.ticker
+    return ChildOrder(ticker, side, min(abs(position), CAP[ticker]), price)
 
 
 class RateLimited(Exception):
@@ -447,6 +524,31 @@ def self_test():
         except ValueError:
             continue
         raise AssertionError("Ambiguous offer should be reviewed manually")
+    # Pricing the exit as two half-refilled children accepts the brief's example.
+    levels = exit_levels(book, "SELL")
+    assert sweep(levels, 50_000, "SELL", cap=25_000, refill=0) == sweep(levels, 50_000, "SELL")
+    assert sweep(levels, 50_000, "SELL", cap=25_000, refill=100).value == 2 * sweep(levels, 25_000, "SELL").value
+    refilled = replace(settings, refill=50)
+    assert evaluate(long, snapshot, refilled).stressed_pnl == Decimal("796")
+    assert evaluate(long, snapshot, refilled).status == "ACCEPT"
+    assert evaluate(poor, snapshot, refilled).status == "WAIT"
+    # A banded child takes only what is displayed near the touch.
+    assert next_unwind(strong, 50_000, book, 0, band=CENT * 2) == ChildOrder("CRZY", "SELL", 8_000, Decimal("9.98"))
+    assert next_unwind(strong, 50_000, book, 0, band=CENT * 3) == ChildOrder("CRZY", "SELL", 25_000, Decimal("9.95"))
+    assert next_unwind(short, -6_000, book, 0, band=ZERO) == ChildOrder("TAME", "BUY", 5_000, Decimal("10.00"))
+    # A resting order steps inside a wide spread and joins a one-cent spread.
+    assert passive_unwind(strong, 50_000, book) == ChildOrder("CRZY", "SELL", 25_000, Decimal("9.99"))
+    assert passive_unwind(short, -6_000, book) == ChildOrder("TAME", "BUY", 6_000, Decimal("9.99"))
+    tight = dict(bids=book["bids"], asks=[dict(price="9.99", quantity=1_000, quantity_filled=0)])
+    assert passive_unwind(strong, 50_000, tight).limit == Decimal("9.99")
+    assert passive_unwind(strong, 50_000, dict(bids=book["bids"], asks=[])).limit == Decimal("9.99")
+    assert passive_unwind(strong, -5_000, book) is None
+    assert next_unwind(strong, 50_000, book, 0, quantity=3_000) == ChildOrder("CRZY", "SELL", 3_000, Decimal("9.98"))
+    # The entry bar scales with volatility and the time left, and ends at zero.
+    assert entry_bar(strong, snapshot, settings, 1, "0.02") == 50_000 * Decimal("0.02") * Decimal(22).sqrt()
+    assert entry_bar(strong, dict(snapshot, tick=122), settings, 1, "0.02") == 0
+    assert entry_bar(strong, snapshot, settings, 0, "0.02") == entry_bar(strong, snapshot, settings, 1, None) == 0
+    assert tick_sigma([Decimal(10)] * 5) is None and tick_sigma([Decimal(10), Decimal(11)] * 8 + [Decimal(10)]) == 1.0
     print("LT3 self-test passed.")
 
 
