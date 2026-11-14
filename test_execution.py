@@ -374,17 +374,58 @@ class TuningTests(unittest.TestCase):
                     order = next(args for verb, path, args in mock.writes if path == "/v1/orders")
                     self.assertEqual((order["quantity"], order["price"]), ([quantity], [price]))
 
+    def test_worked_exit_rests_at_the_touch_and_takes_only_the_shortfall(self):
+        mock = MockRIT()
+        mock.tenders[0]["expires"] = 299
+        with rit_desk(mock) as desk:
+            desk.strategy = replace(Strategy(), work_ticks=20)
+            desk.poll()
+            desk.command("arm", {"api_orders_enabled": True})
+            desk.poll()                  # Accept 50,000 at tick 100.
+            desk.poll()                  # On schedule: rest 25,000 one cent inside the ask.
+            orders = lambda: [args for verb, path, args in mock.writes if path == "/v1/orders"]
+            self.assertEqual((orders()[0]["quantity"], orders()[0]["price"]), (["25000"], ["9.99"]))
+            desk.poll()
+            self.assertEqual(len(mock.writes), 2)   # Still resting, not yet pulled.
+            mock.case["tick"] = 110
+            desk.working.sent_at -= 3
+            desk.poll()                  # Rest is over: pull the remainder. 5,000 had filled.
+            self.assertEqual(mock.writes[-1][:2], ("DELETE", "/v1/orders/1"))
+            desk.poll()                  # Half the time gone, 45,000 left: take the 20,000 shortfall.
+            self.assertEqual((orders()[1]["quantity"], orders()[1]["price"]), (["20000"], ["9.94"]))
+            desk.poll()                  # Back on schedule: rest again.
+            self.assertEqual((orders()[2]["quantity"], orders()[2]["price"]), (["25000"], ["9.99"]))
+            self.assertFalse(desk.fault)
+
+    def test_worked_exit_speeds_up_for_the_next_tender_and_for_the_clock(self):
+        for change in ("tender", "clock"):
+            with self.subTest(change=change):
+                mock = MockRIT()
+                mock.tenders[0]["expires"] = 299
+                with rit_desk(mock) as desk:
+                    desk.strategy = replace(Strategy(), work_ticks=60)
+                    desk.poll()
+                    desk.command("arm", {"api_orders_enabled": True})
+                    desk.poll()
+                    if change == "tender":
+                        mock.tenders.append(dict(demo_snapshot()["tenders"][-1], tender_id=9, expires=299))
+                    else:
+                        mock.case["tick"] = 280
+                    desk.poll()
+                    order = next(args for verb, path, args in mock.writes if path == "/v1/orders")
+                    self.assertEqual((order["quantity"], order["price"]), (["25000"], ["9.94"]))
+
     def test_profile_from_an_earlier_version_keeps_its_values(self):
         with TemporaryDirectory() as folder:
             directory = Path(folder)
             venue = DemoVenue()
             try:
                 earlier = dict(asdict(Strategy()), adverse_move="0.03", depth_haircut=6, ticks_per_child=6)
-                del earlier["refill"], earlier["sweep_band"]
+                del earlier["refill"], earlier["sweep_band"], earlier["work_ticks"]
                 (directory / "strategy.json").write_text(json.dumps(earlier, default=str), encoding="utf-8")
                 strategy = Desk(venue, "rehearsal", directory).strategy
                 self.assertEqual((strategy.adverse_move, strategy.depth_haircut), (Decimal("0.03"), 6))
-                self.assertEqual((strategy.refill, strategy.sweep_band), (0, 0))
+                self.assertEqual((strategy.refill, strategy.sweep_band, strategy.work_ticks), (0, 0, 0))
                 (directory / "strategy.json").write_text("[1, 2", encoding="utf-8")
                 self.assertEqual(Desk(venue, "rehearsal", directory).strategy, Strategy())
             finally:

@@ -32,9 +32,21 @@ Each change is small and sits on the code that produced the results above.
 | **Book refill between orders** (entry model) | 0, the old behaviour | Prices the exit as separate maximum-size orders, with this share of consumed depth back before each. At 50 the brief's accept example passes with a 1¢ adverse move, and its decline example still fails |
 | **Sweep band per order** (unwind) | 0, the old behaviour | A child takes only what is displayed within this many cents of the touch, then the next poll prices a fresh book. Full-size sweeps return automatically when the time budget runs short |
 | **Capture more** preset | Staged for you to apply | Refill 50, adverse move at most 2¢, 4 ticks per order, market closeout in the last 8 ticks |
+| **Work a block out over** (unwind) | 0, the old behaviour | Works the block along a straight line to flat over N ticks. On schedule it rests an order at the touch on its own side. Behind schedule it takes only the shortfall. Full speed returns when time is short or the next good tender is live |
+| **Work the exit** preset | Staged for you to apply | 15-tick worked exit, refill 75, adverse move at most 2¢, 8-tick market closeout |
+| `--book-depth` flag | 50 orders a side, as before | A deeper book request for when large tenders are refused as uncovered |
 | Saved profiles from the earlier version load with the new settings at 0 | | Your tuned `strategy.json` keeps working unchanged |
 
 Nothing changes in how the desk behaves until you apply a setting, apart from the faster chaining.
+
+## The worked exit, and what it costs
+
+This is the largest lever available and the least proven. Do the sums before trusting it.
+
+- **What it buys.** A full 25,000-share order pays the spread, walks several price levels and pays the 2¢ fee on every share. A 3,000-share slice touches only the best level. A resting order that gets hit earns the spread. If working a block saves 5¢ a share, that is $15,000 on a 300,000-share heat. That is the right size to explain much of the gap to the best trader.
+- **What it costs.** Stock held for longer moves with the market. The risk is about `shares × σ × √(ticks ÷ 3)`. For 75,000 shares over 15 ticks with σ at 3¢ a tick that is about $5,000 either way per tender. It has no expected cost, because the price has no drift, but it widens the spread of results. Over 40 ticks it is $8,000, which is why the preset uses 15.
+- **Why take the trade.** You are profitable in every run and well short of the top. A wider spread of results with a higher average is what moves a rank from the top third towards the top three. Staying as you are protects a position that does not win a prize.
+- **What is unproven.** How often a resting order is hit in the real book, and whether RIT charges the fee or pays a rebate on it. One recorded heat answers both: `review.py` prints the exit cost against the mid.
 
 ## Plan for tonight and the morning
 
@@ -43,10 +55,12 @@ The practice server is up until the heats. Change one thing per heat so each res
 1. **Pull, then run `python3 -m unittest`.** Run one heat on your existing settings with `--record`. This confirms the faster chaining on the live feed. Watch that each fill is followed at once by the next order and the desk ends flat.
 2. **Run `python3 review.py`.** Look at two numbers: the median exit cost against the mid, and the list of tenders not taken with their reasons.
 3. **If tenders are being refused** for "Heat closeout window", "Stressed P&L below acceptance threshold" or "Stressed depth cannot cover the block" while showing a positive sweep, apply **Capture more** and run a heat.
-4. **If the exit cost is several cents**, set the sweep band to 3 and run a heat. Keep it if the exit cost falls and unwinds still finish well inside the budget. Drop it if unwinds drag.
+4. **If the exit cost is several cents**, apply **Work the exit** and run a heat. Keep it if the exit cost falls by more than a cent or two and every block finishes flat. If resting orders are almost never hit, set the work window back to 0 and try a sweep band of 3 instead.
 5. **Stop changing things after the last practice heat that went well.** Take that profile into the competition on both laptops.
 
-If there is time for only one heat tonight, do step 1 and step 3 together. Of the three changes, Capture more is the one I would take into the competition without a comparison heat, because the zero-loss record shows the entry rule has slack. The sweep band needs its comparison heat first.
+If there is time for only one practice heat, run it with Capture more and Work the exit both applied, with `--record`, and read `review.py` afterwards. If there is no practice heat at all before 10:45, take Capture more into heat one and leave the work window at 0, because the entry change is plain arithmetic and the worked exit depends on how the real book behaves. Then use the morning heat's recording to decide on the worked exit for the afternoon.
+
+Run Auto in the competition unless you have a reason to overrule a tender. Review mode spends part of every 30-tick window on a click.
 
 ## Settings I would start from
 
@@ -54,14 +68,15 @@ If there is time for only one heat tonight, do step 1 and step 3 together. Of th
 | --- | ---: | ---: | --- |
 | Depth removed | 6% | 6% | Yours, tuned on live fills |
 | Adverse move | 3¢ | 2¢ | With refill at 50 the model is still stricter than a plain one-sweep at 1¢ on single-order blocks |
-| Book refill | 0 | 50 | Stops multi-order blocks being priced as one instant sweep |
+| Book refill | 0 | 50, or 75 with a worked exit | Stops multi-order blocks being priced as one instant sweep |
 | Minimum edge | 0 | 0 | Rank scoring rewards every positive bet |
 | Expiry buffer | 2 | 2 | |
 | Minimum time left | 8 | 8 | |
 | Budget per order | 6 | 4 | Faster chaining roughly halves the time each order needs |
 | Exit reserve | 8 | 8 | |
 | Market closeout | 0 | 8 | Open stock at the close is penalised. This is insurance and costs nothing when the desk is already flat |
-| Sweep band | 0 | 0, then 3 after a comparison heat | Unmeasured |
+| Work a block out over | 0 | 15 after a comparison heat | The largest lever and the least proven |
+| Sweep band | 0 | 0 | The fallback if resting orders are not hit |
 
 ## How to think about one tender
 

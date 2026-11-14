@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, replace
 from decimal import Decimal
 from http.client import HTTPException
+from random import Random
 import json
 from threading import RLock
 import time
@@ -11,11 +12,12 @@ from urllib.parse import urlencode
 
 from rotman_lt3 import (
     CAP, CENT, ZERO, RateLimited, RITReader, Settings, Tender, decimal,
-    evaluate, exit_levels, next_unwind, parse_tender, shares,
+    evaluate, exit_levels, next_unwind, parse_tender, passive_unwind, shares,
 )
 from rotman_lt3_backtest import Heat, SCENARIOS, arrived_order
 
 
+PASSIVE_REST = 2.0  # Seconds a resting order waits for the other side to come to it.
 TERMINAL = {"TRANSACTED", "CANCELLED"}
 
 
@@ -27,6 +29,7 @@ class Strategy(Settings):
     limit_slippage_ticks: int = 1
     market_closeout_ticks: int = 0
     sweep_band: int = 0  # Cents through the touch one child may take. 0 sweeps the full chunk.
+    work_ticks: int = 0  # Ticks over which to work a block out. 0 unwinds at once.
 
     def tender_settings(self, tender):
         chunks = (tender.quantity + CAP[tender.ticker] - 1) // CAP[tender.ticker]
@@ -40,6 +43,7 @@ STRATEGY_FIELDS = {
     "min_heat_ticks": (5, 150), "ticks_per_child": (1, 20),
     "exit_reserve_ticks": (0, 60), "limit_slippage_ticks": (0, 10),
     "market_closeout_ticks": (0, 30), "refill": (0, 100), "sweep_band": (0, 50),
+    "work_ticks": (0, 120),
 }
 
 
@@ -158,11 +162,30 @@ class DemoVenue:
         self.positions[ticker] -= tender.direction * fill.filled
         status = "TRANSACTED" if fill.filled == qty else ("CANCELLED" if limit is None else "OPEN")
         self.orders[self.id] = dict(status=status, ticker=ticker, action=side, quantity=qty,
-                                    quantity_filled=fill.filled, vwap=fill.vwap)
+                                    quantity_filled=fill.filled, vwap=fill.vwap, limit=limit, tick=self.tick())
         return self.id
 
     def order(self, id_):
-        return dict(self.orders[id_])
+        order = self.orders[id_]
+        tick = self.tick()
+        if order["status"] == "OPEN" and tick > order["tick"]:
+            # Rehearsal assumption: a resting order at or inside the touch meets
+            # up to 3,000 shares of incoming flow per tick, at its own price.
+            selling = order["action"] == "SELL"
+            book = self.heat.book(order["ticker"], tick)
+            ours = exit_levels(book, "BUY" if selling else "SELL")
+            at_touch = not ours or (order["limit"] <= ours[0][0] if selling else order["limit"] >= ours[0][0])
+            flow = Random(self.heat.seed * 31 + tick).randint(0, 3_000) * (tick - order["tick"]) if at_touch else 0
+            fill = min(order["quantity"] - order["quantity_filled"], flow)
+            order["tick"] = tick
+            if fill:
+                value = (order["vwap"] or ZERO) * order["quantity_filled"] + fill * order["limit"]
+                order["quantity_filled"] += fill
+                order["vwap"] = value / order["quantity_filled"]
+                self.positions[order["ticker"]] += -fill if selling else fill
+                if order["quantity_filled"] == order["quantity"]:
+                    order["status"] = "TRANSACTED"
+        return dict(order)
 
     def cancel(self, id_):
         self.orders[id_]["status"] = "CANCELLED"
@@ -178,6 +201,7 @@ class Inventory:
     tender_fee: Decimal
     confirmed: bool = False
     proceeds: Decimal = ZERO
+    start_tick: int | None = None
 
 
 @dataclass
@@ -187,6 +211,7 @@ class WorkingOrder:
     sent_at: float
     cancelled_at: float | None = None
     terminal_at: float | None = None
+    rest: float = 0.45  # Seconds an unfilled remainder may rest before it is pulled.
 
 
 class Desk:
@@ -196,6 +221,7 @@ class Desk:
         self.state_dir = state_dir
         self.record = record
         self.lock = RLock()
+        self.book_depth = 50
         self.strategy = Strategy()
         self.revision = 1
         self.events = deque(maxlen=60)
@@ -355,7 +381,7 @@ class Desk:
         # revisions apply between complete iterations and never race a submission.
         with self.lock:
             try:
-                status, snapshot = self.venue.snapshot(50)
+                status, snapshot = self.venue.snapshot(self.book_depth)
             except RateLimited:
                 raise
             except (OSError, HTTPException, ValueError, RuntimeError, KeyError, TypeError) as error:
@@ -487,9 +513,23 @@ class Desk:
         chunks = (abs(position) + CAP[tender.ticker] - 1) // CAP[tender.ticker]
         hurried = remaining <= self.strategy.exit_reserve_ticks + self.strategy.ticks_per_child * chunks
         band = CENT * self.strategy.sweep_band if self.strategy.sweep_band and not hurried else None
-        child = next_unwind(tender, position, book, open_orders=0, band=band)
-        if 0 < remaining <= self.strategy.market_closeout_ticks:
+        closeout = 0 < remaining <= self.strategy.market_closeout_ticks
+        rest, behind = 0.45, None
+        if self.strategy.work_ticks and not hurried and not closeout and not self.tender_waiting(snapshot):
+            # Work the block along a straight line to flat over `work_ticks`.
+            # On or ahead of the line, rest an order at the touch on our side.
+            # Behind it, take only the shortfall from the other side.
+            if inventory.start_tick is None:
+                inventory.start_tick = snapshot["tick"]
+            left = max(0, self.strategy.work_ticks - (snapshot["tick"] - inventory.start_tick))
+            behind = abs(position) - tender.quantity * left // self.strategy.work_ticks
+        resting = passive_unwind(tender, position, book) if behind is not None and behind <= 0 else None
+        child = None if resting else next_unwind(tender, position, book, open_orders=0, band=band,
+                                                 quantity=behind if behind and behind > 0 else None)
+        if closeout:
             qty, limit = min(abs(position), CAP[tender.ticker]), None
+        elif resting:
+            qty, limit, rest = resting.quantity, resting.limit, PASSIVE_REST
         elif child:
             qty = child.quantity
             slip = CENT * self.strategy.limit_slippage_ticks
@@ -497,9 +537,20 @@ class Desk:
         else:
             return
         order_id = self.venue.submit(tender.ticker, tender.exit_side, qty, limit)
-        self.working = WorkingOrder(order_id, qty, time.monotonic())
-        price = "market" if limit is None else f"limit {limit:.2f}"
+        self.working = WorkingOrder(order_id, qty, time.monotonic(), rest=rest)
+        price = "market" if limit is None else f"{'resting' if resting else 'limit'} {limit:.2f}"
         self.log("ORDER", f"#{order_id} {tender.exit_side} {qty:,} {tender.ticker} · {price}")
+
+    def tender_waiting(self, snapshot):
+        """Is a tender live that the desk would take from a flat book?
+
+        The desk holds one block at a time, so a worked exit is finished at
+        full speed when the next acceptable tender is on the clock.
+        """
+        flat = dict(snapshot, positions=dict.fromkeys(snapshot["positions"], 0), open_orders=0)
+        return any(decision and decision.status == "ACCEPT"
+                   and tender.id not in self.attempted and tender.id not in self.skipped
+                   for tender, decision, _ in self.decisions(flat))
 
     def reconcile_order(self, position, now):
         working = self.working
@@ -523,7 +574,7 @@ class Desk:
             raise RuntimeError("Order reported an invalid fill quantity")
         status = order["status"]
         if status == "OPEN":
-            if working.cancelled_at is None and (self.halted or now - working.sent_at >= 0.45):
+            if working.cancelled_at is None and (self.halted or now - working.sent_at >= working.rest):
                 working.cancelled_at = time.monotonic()
                 self.venue.cancel(working.id)  # It may already have filled. Recheck the order.
                 self.log("CANCEL SENT", f"Working child #{working.id}")

@@ -104,7 +104,7 @@ input[type="checkbox"] { accent-color: var(--mint); vertical-align: middle; }
 .exit-count { justify-content: start; margin-top: 10px; }
 #working { margin-top: 5px; }
 #reset { margin-top: 5px; }
-.presets { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin-block: 10px; }
+.presets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-block: 10px; }
 .presets button { display: grid; gap: 4px; text-align: left; white-space: normal; }
 .presets small { color: var(--muted); font-weight: 400; font-size: 11px; }
 .draft { border: 1px solid #7d643f; border-radius: 8px; background: #2d281e; padding: 8px 10px; margin-bottom: 10px; }

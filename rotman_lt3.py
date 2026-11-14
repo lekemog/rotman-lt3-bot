@@ -230,7 +230,7 @@ def evaluate(tender, snapshot, settings):
     return replace(decision, status="ACCEPT", reason="Full stressed unwind clears fees and edge")
 
 
-def next_unwind(confirmed_tender, position, book, open_orders, band=None):
+def next_unwind(confirmed_tender, position, book, open_orders, band=None, quantity=None):
     """Suggest one marketable limit for confirmed inventory from a flat start.
 
     Recheck fills and position before asking for another slice. A partially
@@ -249,10 +249,34 @@ def next_unwind(confirmed_tender, position, book, open_orders, band=None):
         # touch. The rest of the chunk waits for the book to refill.
         best = levels[0][0]
         levels = [(price, size) for price, size in levels if abs(price - best) <= band]
-    quote = sweep(levels, min(abs(position), CAP[ticker]), side)
+    quote = sweep(levels, min(abs(position), CAP[ticker], quantity or CAP[ticker]), side)
     if quote.filled == 0:
         return None
     return ChildOrder(ticker, side, quote.filled, quote.worst_price)
+
+
+def passive_unwind(confirmed_tender, position, book):
+    """Describe one resting order at the touch on our own side of the book.
+
+    Selling, it joins the best ask, or steps one cent inside it when the spread
+    allows, so incoming buyers reach it first. It never crosses the spread.
+    """
+    if position * confirmed_tender.direction <= 0:
+        return None
+    side = confirmed_tender.exit_side
+    ours = exit_levels(book, "BUY" if side == "SELL" else "SELL")   # Quotes we would join.
+    theirs = exit_levels(book, side)                                 # Quotes we would hit.
+    step = -CENT if side == "SELL" else CENT
+    if ours and theirs:
+        price = ours[0][0] + step if abs(ours[0][0] - theirs[0][0]) >= 2 * CENT else ours[0][0]
+    elif ours:
+        price = ours[0][0]
+    elif theirs:
+        price = theirs[0][0] - step
+    else:
+        return None
+    ticker = confirmed_tender.ticker
+    return ChildOrder(ticker, side, min(abs(position), CAP[ticker]), price)
 
 
 class RateLimited(Exception):
@@ -485,6 +509,14 @@ def self_test():
     assert next_unwind(strong, 50_000, book, 0, band=CENT * 2) == ChildOrder("CRZY", "SELL", 8_000, Decimal("9.98"))
     assert next_unwind(strong, 50_000, book, 0, band=CENT * 3) == ChildOrder("CRZY", "SELL", 25_000, Decimal("9.95"))
     assert next_unwind(short, -6_000, book, 0, band=ZERO) == ChildOrder("TAME", "BUY", 5_000, Decimal("10.00"))
+    # A resting order steps inside a wide spread and joins a one-cent spread.
+    assert passive_unwind(strong, 50_000, book) == ChildOrder("CRZY", "SELL", 25_000, Decimal("9.99"))
+    assert passive_unwind(short, -6_000, book) == ChildOrder("TAME", "BUY", 6_000, Decimal("9.99"))
+    tight = dict(bids=book["bids"], asks=[dict(price="9.99", quantity=1_000, quantity_filled=0)])
+    assert passive_unwind(strong, 50_000, tight).limit == Decimal("9.99")
+    assert passive_unwind(strong, 50_000, dict(bids=book["bids"], asks=[])).limit == Decimal("9.99")
+    assert passive_unwind(strong, -5_000, book) is None
+    assert next_unwind(strong, 50_000, book, 0, quantity=3_000) == ChildOrder("CRZY", "SELL", 3_000, Decimal("9.98"))
     print("LT3 self-test passed.")
 
 
