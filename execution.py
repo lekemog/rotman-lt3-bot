@@ -65,8 +65,8 @@ def strategy_from_dict(data):
 
 
 class RITVenue(RITReader):
-    def __init__(self, port, enable_orders, *, mode="client", dma_https=False):
-        super().__init__(mode, port, dma_https=dma_https)
+    def __init__(self, port, enable_orders, *, mode="client", dma_https=False, host=None):
+        super().__init__(mode, port, dma_https=dma_https, host=host)
         self.enable_orders = enable_orders
         self.next_submit = 0.0
 

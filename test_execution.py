@@ -222,6 +222,19 @@ class ExecutionTests(unittest.TestCase):
             desk.poll()
             self.assertEqual(mock.writes[1][1], "/v1/orders")
 
+    def test_mac_dma_connects_to_the_server_the_organisers_give(self):
+        seen = []
+
+        def connect(host, port, timeout):
+            seen.append((host, port))
+            return HTTPConnection(host, port, timeout=timeout)
+
+        with patch("rotman_lt3.HTTPConnection", side_effect=connect), \
+             patch("builtins.input", return_value="team"), patch("rotman_lt3.getpass", return_value="pass"):
+            RITVenue(16555, True, mode="dma", host="competition.example").close()
+            RITVenue(None, True, mode="dma").close()
+        self.assertEqual(seen, [("competition.example", 16555), ("flserver.rotman.utoronto.ca", 16540)])
+
     def test_mac_dma_reads_in_parallel_between_clock_checks(self):
         mock = MockRIT()
         mock.read_gate = Barrier(5)

@@ -101,6 +101,8 @@ def main():
     connection.add_argument("--mac", action="store_true", help="Use the Rotman DMA API on a MacBook")
     parser.add_argument("--enable-orders", action="store_true", help="Enable the arm control for RIT")
     parser.add_argument("--rit-port", type=int, help="RIT port (Windows local default 9999, Mac practice default 16540)")
+    parser.add_argument("--rit-host", help="Mac only: the server host name given by the organisers"
+                                           " (default flserver.rotman.utoronto.ca)")
     parser.add_argument("--dma-https", action="store_true", help="Use HTTPS when Rotman supplies a TLS DMA port")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--state-dir", type=Path, default=Path(".rotman"))
@@ -116,8 +118,8 @@ def main():
     live = args.windows or args.mac
     if args.enable_orders and not live:
         parser.error("Use --enable-orders with --windows or --mac. Rehearsal can be armed from the dashboard.")
-    if args.dma_https and not args.mac:
-        parser.error("Use --dma-https with --mac")
+    if (args.dma_https or args.rit_host) and not args.mac:
+        parser.error("Use --dma-https and --rit-host with --mac. On Windows the RIT Client chooses the server.")
     if not 1 <= args.port <= 65535 or (args.rit_port is not None and not 1 <= args.rit_port <= 65535):
         parser.error("Use port numbers between 1 and 65535")
     if args.busy_interval is None:
@@ -128,7 +130,7 @@ def main():
         parser.error("Use a book depth between 20 and 500 orders")
     args.state_dir.mkdir(parents=True, exist_ok=True)
     venue = RITVenue(args.rit_port, args.enable_orders, mode="dma" if args.mac else "client",
-                     dma_https=args.dma_https) if live else DemoVenue()
+                     dma_https=args.dma_https, host=args.rit_host) if live else DemoVenue()
     desk = Desk(venue, "rit" if live else "rehearsal", args.state_dir, args.record)
     desk.book_depth = args.book_depth
     with ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(desk, args.port)) as server:
